@@ -1,0 +1,27 @@
+Castika Simple Browser Recorder (Lua Script)
+Copyright (c) 2026 Castika
+
+https://github.com/Castika-Coce/simple-browser-recorder
+
+Licensed under the Apache License, Version 2.0 (the "License").
+See the LICENSE file for the full terms.
+
+----------------------------------------------------------------------
+Name and attribution
+----------------------------------------------------------------------
+
+You may use, modify and redistribute this software under the License.
+Two things travel with it and may not be dropped:
+
+  1. The copyright and licence notice in the header of the script file,
+     and this NOTICE file. Section 4(a) and 4(d) of the License require
+     both to be retained in any redistribution. A modifier adds their
+     own notice below them, never in place of them.
+
+  2. Section 4(b) requires any modified file to carry a prominent
+     notice stating that it was changed.
+
+Section 6 of the License grants no trademark rights. "Castika" and
+"Castika Simple Browser Recorder" are names of this project, and a
+modified version may not be distributed under them. Rename your fork;
+keep the attribution.
