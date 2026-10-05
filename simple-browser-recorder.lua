@@ -1,5 +1,5 @@
 -- Castika Simple Browser Recorder (Lua Script)
--- v0.9.0 - 2026-10-05
+-- v0.9.2 - 2026-10-05
 -- Copyright (c) 2026 Castika
 -- Licensed under the Apache License, Version 2.0
 -- https://github.com/Castika-Coce/simple-browser-recorder
@@ -31,6 +31,12 @@ local OUT_TAIL_MS = 300
 
 -- libobs mixes to MAX_AUDIO_MIXES tracks and an audio encoder draws from exactly one
 local MAX_AUDIO_MIXES = 6
+local REC_MIX_IDX = MAX_AUDIO_MIXES - 1
+local REC_MIX_BIT = math.floor(2 ^ REC_MIX_IDX)
+local AUD_RESTORE_MS = 1500
+
+local PRIME_WAIT_MS = 4000
+local FAIL_CARD_MS = 30000
 
 local cfg = {
     enabled         = true,
@@ -137,7 +143,7 @@ local st = {
     rec_card_t0     = nil,
     rec_card_txt    = nil,
     rec_card_n      = nil,
-    rec_card_fe     = nil,
+    fail_card_ms    = nil,
 
     ev_off          = 0,
     url_live        = nil,
@@ -152,7 +158,17 @@ local st = {
     hv_frames_ms    = nil,
     hv_api_warned   = nil,
 
-    aud_muted       = nil,
+    prime_phase     = nil,
+    prime_ms        = nil,
+    prime_tries     = 0,
+    prime_bad       = nil,
+    fe_ours         = nil,
+    fe_stop_asked   = nil,
+
+    aud_saved       = nil,
+    aud_on          = nil,
+    aud_delay_ms    = nil,
+    aud_delay_why   = nil,
 
     -- hv_size stays last in this table; suites slice it as their end anchor
     hv_size         = nil,
@@ -179,6 +195,18 @@ local function our_take_now()
     if hv_active() then return true end
     if st.we_record and obs.obs_frontend_recording_active() then return true end
     return false
+end
+
+local function foreign_output_now()
+    local rec = false
+    if obs.obs_frontend_recording_active and obs.obs_frontend_recording_active() then
+        rec = not (st.fe_ours or st.fe_stop_asked)
+    end
+    local str = false
+    if obs.obs_frontend_streaming_active and obs.obs_frontend_streaming_active() then
+        str = true
+    end
+    return rec, str
 end
 
 local function trim(s)
@@ -458,14 +486,14 @@ local PLAYER_HTML = [==[
       <div class="ctlgrp">
         <div class="ctlbtns">
           <button id="ctlpp" title="play / pause"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg><em>PREVIEW</em></button>
-          <button id="ctlprange" title="play the range"><svg viewBox="0 0 24 24"><path d="M4 3v18"/><path d="M20 3v18"/><path d="M8 5l9 7-9 7z"/></svg><em>RANGE</em></button>
-          <button id="ctlloop" class="ctlon" title="loop"><svg viewBox="0 0 24 24"><path d="M4 12V9a3 3 0 013-3h13"/><path d="M17 3l3 3-3 3"/><path d="M20 12v3a3 3 0 01-3 3H4"/><path d="M7 21l-3-3 3-3"/></svg><em>LOOP</em></button>
         </div>
       </div>
       <div class="ctlgap"></div>
       <div class="ctlgrp">
         <div class="ctlbtns">
-          <button id="ctlmute" title="sound"><svg viewBox="0 0 24 24"><path d="M5 9v6h4l5 4V5L9 9z"/><path d="M17 9a4 4 0 010 6"/></svg><em>SOUND</em></button>
+          <button id="ctlprange" title="range: confine playback to the in-out range"><svg viewBox="0 0 24 24"><path d="M4 3v18"/><path d="M20 3v18"/><path d="M7 12h10"/></svg></button>
+          <button id="ctlloop" class="ctlon" title="loop: at the end, start again instead of stopping"><svg viewBox="0 0 24 24"><path d="M4 12V9a3 3 0 013-3h13"/><path d="M17 3l3 3-3 3"/><path d="M20 12v3a3 3 0 01-3 3H4"/><path d="M7 21l-3-3 3-3"/></svg></button>
+          <button id="ctlmute" title="sound"><svg viewBox="0 0 24 24"><path d="M5 9v6h4l5 4V5L9 9z"/><path d="M17 9a4 4 0 010 6"/></svg></button>
           <button id="ctlconfirm" class="ctlgo" title="confirm to OBS"><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg><em>CONFIRM TO OBS</em></button>
         </div>
       </div>
@@ -552,8 +580,9 @@ local PLAYER_HTML = [==[
   var ctlOn = false, ctlDead = false, ctlRaf = null;
   var ctlIn = 0, ctlOut = -1;
   var ctlPos = 0;
-  var ctlLoop = true;
-  var ctlRangeTo = -1, ctlPlaying = false, ctlMuted = true, ctlState = -99;
+  var ctlLoop = true, ctlRange = false;
+  var ctlPlaying = false, ctlMuted = true, ctlState = -99;
+  var ctlLitPP = null, ctlLitRG = null, ctlLitLP = null;
   var ctlDrag = false, ctlDragPlay = false, ctlSeekMs = 0;
   var ctlSeeded = false;
   var curPad = OVER, curIW = 0, curIH = 0;
@@ -902,7 +931,6 @@ local PLAYER_HTML = [==[
   }
   function ctlPause(){
     if (!player) { return; }
-    ctlRangeTo = -1;
     try { player.pauseVideo(); } catch (x) {}
     ctlPlaying = false;
   }
@@ -984,10 +1012,32 @@ local PLAYER_HTML = [==[
   }
   window.addEventListener('resize', layoutCtl);
 
+  function ctlBtnPaint(){
+    var pp = ctlPlaying;
+    try {
+      if (pp !== ctlLitPP) {
+        ctlLitPP = pp;
+        ctlE('ctlpp').classList.toggle('ctlon', pp);
+        ctlE('ctlpp').querySelector('svg').innerHTML = pp
+          ? '<path d="M8 5v14"/><path d="M16 5v14"/>'
+          : '<path d="M7 4l13 8-13 8z"/>';
+      }
+      if (ctlRange !== ctlLitRG) {
+        ctlLitRG = ctlRange;
+        ctlE('ctlprange').classList.toggle('ctlon', ctlRange);
+      }
+      if (ctlLoop !== ctlLitLP) {
+        ctlLitLP = ctlLoop;
+        ctlE('ctlloop').classList.toggle('ctlon', ctlLoop);
+      }
+    } catch (x) {}
+  }
+
   function ctlPaint(){
     var a = ctlAt();
     if (!ctlDrag && a >= 0) { ctlPos = a; }
     var o = ctlOutV();
+    ctlBtnPaint();
     try {
       ctlE('ctlnow').textContent = (a >= 0) ? ctlFmt(a) : '--.---';
       ctlE('ctlvin').textContent = ctlFmt(ctlIn);
@@ -1004,8 +1054,15 @@ local PLAYER_HTML = [==[
     } catch (x) {}
   }
 
+  function ctlHome(){
+    return ctlRange ? ctlIn : 0;
+  }
+
   function ctlOnEnded(){
-    ctlSeekTo(0);
+    var h = ctlHome();
+    ctlSeekTo(h);
+    ctlPos = h;
+    if (ctlLoop) { ctlPlay(); return; }
     ctlPause();
   }
 
@@ -1021,16 +1078,15 @@ local PLAYER_HTML = [==[
         ctlState = ps;
         if (ps === 0) { ctlOnEnded(); }
       }
-      if (ctlRangeTo >= 0) {
+      if (ctlRange && ctlPlaying) {
         var a2 = ctlAt();
-        if (a2 >= 0 && a2 >= ctlRangeTo) {
+        var o2 = ctlOutV();
+        if (a2 >= 0 && o2 > ctlIn && a2 >= o2) {
           if (ctlLoop) {
             ctlSeekTo(ctlIn);
             ctlPos = ctlIn;
           } else {
-            ctlRangeTo = -1;
-            try { player.pauseVideo(); } catch (x) {}
-            ctlPlaying = false;
+            ctlPause();
           }
         }
       }
@@ -1087,7 +1143,6 @@ local PLAYER_HTML = [==[
       el.classList.add('ctldrag');
       ctlDrag = true;
       ctlDragPlay = ctlPlaying;
-      ctlRangeTo = -1;
       ctlPause();
       set(ctlTAt(ev), false);
       var move = function(e){
@@ -1161,7 +1216,6 @@ local PLAYER_HTML = [==[
         } catch (x) {}
         var t = ctlTAt(ev);
         if (!(t >= 0)) { return; }
-        ctlRangeTo = -1;
         ctlPos = t;
         ctlSeekTo(t);
         ctlPaint();
@@ -1170,22 +1224,20 @@ local PLAYER_HTML = [==[
 
     ctlBind('ctlloop', function(){
       ctlLoop = !ctlLoop;
-      try { ctlE('ctlloop').classList.toggle('ctlon', ctlLoop); } catch (x) {}
+      ctlPaint();
     });
 
     ctlBind('ctlpp', function(){
       if (!player) { return; }
-      ctlRangeTo = -1;
       try {
         if (ctlPlaying) { player.pauseVideo(); ctlPlaying = false; }
-        else { player.playVideo(); ctlPlaying = true; }
+        else {
+          if (ctlRange) { ctlPos = ctlIn; ctlSeekTo(ctlIn); }
+          player.playVideo();
+          ctlPlaying = true;
+        }
       } catch (x) {}
-      try {
-        ctlE('ctlpp').classList.toggle('ctlon', ctlPlaying);
-        ctlE('ctlpp').querySelector('svg').innerHTML = ctlPlaying
-          ? '<path d="M8 5v14"/><path d="M16 5v14"/>'
-          : '<path d="M7 4l13 8-13 8z"/>';
-      } catch (x) {}
+      ctlPaint();
     });
     ctlBind('ctlmute', function(){
       if (!player) { return; }
@@ -1196,12 +1248,11 @@ local PLAYER_HTML = [==[
       try { ctlE('ctlmute').classList.toggle('ctlon', !ctlMuted); } catch (x) {}
     });
     ctlBind('ctlprange', function(){
-      if (!player) { return; }
-      var o = ctlOutV();
-      ctlRangeTo = (o > ctlIn) ? o : -1;
-      ctlPos = ctlIn;
-      ctlSeekTo(ctlIn);
-      ctlPlay();
+      ctlRange = !ctlRange;
+      if (ctlRange && ctlPlaying) {
+        ctlPos = ctlIn;
+        ctlSeekTo(ctlIn);
+      }
       ctlPaint();
     });
 
@@ -1242,12 +1293,12 @@ local PLAYER_HTML = [==[
     ctlSeedOut();
     ctlPaint();
     layoutCtl();
-    if (!ctlSeeded && T0 > 0) {
+    if (!ctlSeeded && ctlIn > 0) {
       ctlSeeded = true;
-      ctlPos = T0;
-      ctlSeekTo(T0);
+      ctlPos = ctlIn;
+      ctlSeekTo(ctlIn);
     }
-    report('ctl_on', '&t=' + T0.toFixed(3));
+    report('ctl_on', '&t=' + T0.toFixed(3) + '&mark=' + ctlIn.toFixed(3));
     if (ctlRaf === null) { ctlRaf = requestAnimationFrame(ctlTick); }
   }
 
@@ -1973,33 +2024,18 @@ if (Test-Path -LiteralPath $Stop) {
 say 'stopped'
 ]==]
 
--- os.execute goes through cmd.exe and OBS has no console, so a window flashes
 local function ensure_dir(dir)
     local probe = join(dir, "yt_probe.tmp")
-    local f = io.open(probe, "wb")
-    if f then
+    local function can_write()
+        local f = io.open(probe, "wb")
+        if not f then return false end
         f:close()
         os.remove(probe)
         return true
     end
-
-    local tmp = os.getenv("TEMP") or "C:\\"
-    local vbs = join(tmp, "_obs_yt_mkdir.vbs")
-    local body = string.format(
-        'Set fso = CreateObject("Scripting.FileSystemObject")\r\n' ..
-        'p = "%s"\r\n' ..
-        'If Not fso.FolderExists(p) Then\r\n' ..
-        '  Dim parts, acc, i\r\n' ..
-        '  parts = Split(p, "\\")\r\n' ..
-        '  acc = parts(0)\r\n' ..
-        '  For i = 1 To UBound(parts)\r\n' ..
-        '    acc = acc & "\\" & parts(i)\r\n' ..
-        '    If Not fso.FolderExists(acc) Then fso.CreateFolder(acc)\r\n' ..
-        '  Next\r\n' ..
-        'End If\r\n', dir)
-    write_file(vbs, body)
-    os.execute(string.format('wscript.exe //B //Nologo "%s"', vbs))
-    return true
+    if can_write() then return true end
+    if type(dir) == "string" and dir ~= "" then obs.os_mkdirs(dir) end
+    return can_write()
 end
 
 local function write_assets()
@@ -2056,6 +2092,7 @@ local function start_server()
         return false
     end
 
+    -- os.execute goes through cmd.exe and OBS has no console, so a window flashes
     os.execute(string.format('wscript.exe //B //Nologo "%s"', p.vbs))
     st.server_launched = true
     st.health_ms = 3000
@@ -2185,6 +2222,8 @@ end
 local function effective_start_sec()
     local i = tonumber(st.in_sec or 0) or 0
     if i > 0 then return i end
+    local u = tonumber(url_time_now() or 0) or 0
+    if u > 0 then return u end
     return 0
 end
 
@@ -2455,6 +2494,25 @@ local function source_url_now()
     return url
 end
 
+local function panel_url_now()
+    if script_settings then
+        local s = trim(obs.obs_data_get_string(script_settings, "yt_url") or "")
+        if s ~= "" then return s end
+    end
+    return trim(cfg.yt_url or "")
+end
+
+local function resolve_video_id()
+    local raw = panel_url_now()
+    local vid = extract_youtube_id(raw)
+    if vid then return vid, "panel", raw end
+    vid = video_id_from_source(REC_SOURCE_NAME)
+    if vid then return vid, "source", raw end
+    vid = trim(st.video_id or "")
+    if vid ~= "" then return vid, "state", raw end
+    return nil, nil, raw
+end
+
 local function bail(reason, fmt, ...)
     if st.bail_warned ~= reason then
         st.bail_warned = reason
@@ -2500,7 +2558,7 @@ local function create_or_update_source()
 
     local name = REC_SOURCE_NAME
 
-    local video_id = video_id_from_source(name) or trim(st.video_id)
+    local video_id, id_from, panel_raw = resolve_video_id()
     if not video_id or video_id == "" then
         return bail("novideo",
             "No YouTube URL yet. Paste one into the 'YouTube URL' box in this script's settings panel, or straight into the browser source's own URL field - the box writes into that same field.")
@@ -2535,6 +2593,7 @@ local function create_or_update_source()
     obs.obs_data_release(data)
     obs.obs_source_release(existing)
     st.url_live = trim(page_url)
+    if id_from == "panel" then st.yt_url_applied = panel_raw end
     log("Browser source '%s' updated (id: %s, %dx%d)", name, video_id, w, h)
     return true
 end
@@ -2545,6 +2604,7 @@ local function arm_control_layer(video_id)
         return nil
     end
     video_id = trim(video_id or "")
+    if video_id == "" then video_id = resolve_video_id() or "" end
     if video_id == "" then
         log("No YouTube video is configured yet, so the trim controls have nothing to show. Paste a YouTube URL into the 'YouTube URL' box in this script's settings first.")
         return nil
@@ -2647,8 +2707,8 @@ local function auto_convert_source_url()
         obs.obs_data_set_double(script_settings, "url_time_sec", t or -1)
     end
     if t then
-        log("URL t= detected: %ss. It is the position the trim control window will OPEN at - it is not an in-point, and it does not move where the recording starts. Choose the in-point in the control window.",
-            num_str(t))
+        log("URL t= detected: %ss. That is the DEFAULT IN-POINT: with no trim range stored, the recording starts there, the page is loaded %ds earlier and plays forward behind the mask, and the trim controls open with the in-mark on it and the out-mark at the end of the video. A range confirmed in the control window outranks it, because that is the later and more explicit choice. Clearing the t from the URL gives the whole video back.",
+            num_str(t), RUNUP_SEC)
     end
 
     st.convert_fail = nil
@@ -2703,7 +2763,56 @@ local function configured_source_on_program()
     return on_program and true or false
 end
 
-local AUD_KEY = "muted_sources"
+local HV_EXT = {
+    hybrid_mp4     = "mp4",
+    hybrid_mov     = "mov",
+    fragmented_mp4 = "mp4",
+    fragmented_mov = "mov",
+    mpegts         = "ts",
+    hls            = "m3u8",
+}
+
+local function prof_cfg()
+    if obs.obs_frontend_get_profile_config == nil then return nil end
+    local ok, c = pcall(obs.obs_frontend_get_profile_config)
+    if not ok or not c then return nil end
+    return c
+end
+
+local function cfg_str(c, sec, key)
+    if not c or obs.config_get_string == nil then return "" end
+    local ok, v = pcall(obs.config_get_string, c, sec, key)
+    if not ok or v == nil then return "" end
+    return trim(v)
+end
+
+local function cfg_int(c, sec, key)
+    if not c or obs.config_get_int == nil then return 0 end
+    local ok, v = pcall(obs.config_get_int, c, sec, key)
+    if not ok then return 0 end
+    return math.floor(tonumber(v) or 0)
+end
+
+local function out_mode(c)
+    local m = cfg_str(c, "Output", "Mode")
+    if m == "Advanced" then return "Advanced" end
+    return "Simple"
+end
+
+local function out_section(c)
+    return (out_mode(c) == "Advanced") and "AdvOut" or "SimpleOutput"
+end
+
+local function first_track(mask)
+    mask = math.floor(tonumber(mask) or 0)
+    if mask <= 0 then return nil end
+    for i = 0, MAX_AUDIO_MIXES - 1 do
+        if math.floor(mask / math.floor(2 ^ i)) % 2 == 1 then return i end
+    end
+    return nil
+end
+
+local AUD_KEY = "isolated_sources"
 
 -- obs_enum_sources and source_list_release are added by the scripting glue, not by SWIG
 local function aud_list_sources()
@@ -2728,15 +2837,52 @@ local function aud_carries_audio(src)
     return math.floor(fl / bit) % 2 == 1
 end
 
+local function aud_mask_of(src)
+    if obs.obs_source_get_audio_mixers == nil then return nil end
+    local ok, m = pcall(obs.obs_source_get_audio_mixers, src)
+    if not ok then return nil end
+    m = math.floor(tonumber(m) or 0)
+    if m < 0 then return nil end
+    return m
+end
+
+local function aud_has_rec_mix(mask)
+    return math.floor(mask / REC_MIX_BIT) % 2 == 1
+end
+
+local function aud_cfg_rec_mix()
+    local c = prof_cfg()
+    if not c then return false end
+    local m = cfg_int(c, out_section(c), "RecTracks")
+    if m <= 0 then return false end
+    return aud_has_rec_mix(m)
+end
+
+local function aud_rec_mix_taken()
+    if obs.obs_frontend_get_recording_output == nil
+       or obs.obs_output_get_mixers == nil then
+        return aud_cfg_rec_mix()
+    end
+    local out = obs.obs_frontend_get_recording_output()
+    if not out then return aud_cfg_rec_mix() end
+    local ok, m = pcall(obs.obs_output_get_mixers, out)
+    pcall(obs.obs_output_release, out)
+    if not ok then return aud_cfg_rec_mix() end
+    m = math.floor(tonumber(m) or 0)
+    if m <= 0 then return aud_cfg_rec_mix() end
+    return aud_has_rec_mix(m)
+end
+
 local function aud_write_record()
     if not script_settings then return false end
     if obs.obs_data_array_create == nil or obs.obs_data_set_array == nil then
         return false
     end
     local arr = obs.obs_data_array_create()
-    for _, nm in ipairs(st.aud_muted or {}) do
+    for _, e in ipairs(st.aud_saved or {}) do
         local it = obs.obs_data_create()
-        obs.obs_data_set_string(it, "n", nm)
+        obs.obs_data_set_string(it, "n", e.n)
+        obs.obs_data_set_int(it, "m", e.m)
         obs.obs_data_array_push_back(arr, it)
         obs.obs_data_release(it)
     end
@@ -2755,7 +2901,8 @@ local function aud_read_record(settings)
         local it = obs.obs_data_array_item(arr, i)
         if it then
             local nm = trim(obs.obs_data_get_string(it, "n") or "")
-            if nm ~= "" then out[#out + 1] = nm end
+            local m = math.floor(tonumber(obs.obs_data_get_int(it, "m")) or 0)
+            if nm ~= "" and m >= 0 then out[#out + 1] = { n = nm, m = m } end
             obs.obs_data_release(it)
         end
     end
@@ -2764,72 +2911,94 @@ local function aud_read_record(settings)
 end
 
 local function aud_restore(why, keep_missing)
-    local names = st.aud_muted
-    if names == nil or #names == 0 then
-        st.aud_muted = nil
+    st.aud_delay_ms = nil
+    st.aud_delay_why = nil
+    local saved = st.aud_saved
+    if saved == nil or #saved == 0 then
+        st.aud_saved = nil
         return 0, 0
     end
     local back, gone, left = 0, 0, {}
-    for _, nm in ipairs(names) do
-        local src = obs.obs_get_source_by_name(nm)
+    for _, e in ipairs(saved) do
+        local src = obs.obs_get_source_by_name(e.n)
         if src then
-            pcall(obs.obs_source_set_muted, src, false)
+            pcall(obs.obs_source_set_audio_mixers, src, e.m)
             obs.obs_source_release(src)
             back = back + 1
         else
             gone = gone + 1
-            if keep_missing then left[#left + 1] = nm end
+            if keep_missing then left[#left + 1] = e end
         end
     end
-    st.aud_muted = (#left > 0) and left or nil
+    st.aud_saved = (#left > 0) and left or nil
     aud_write_record()
     local tail = ""
     if gone > 0 and keep_missing then
-        tail = string.format(" %d of them is not in this scene collection under the name it was muted under, so it is being kept on the record and tried once more at the end of the next take - a collection that had not finished loading is the ordinary reason, and a source that has simply been deleted costs one more attempt and is then dropped.", gone)
+        tail = string.format(" %d of them is not in this scene collection under the name its tracks were recorded under, so it is being kept on the record and tried once more at the end of the next take - a collection that had not finished loading is the ordinary reason, and a source that has simply been deleted costs one more attempt and is then dropped.", gone)
     elseif gone > 0 then
-        tail = string.format(" %d of them no longer exists under the name it was muted under, which is not an error and does not hold anything else up: a source deleted or renamed since the mute cannot be put back, and every other one was.", gone)
+        tail = string.format(" %d of them no longer exists under the name its tracks were recorded under, which is not an error and does not hold anything else up: a source deleted or renamed since the take started cannot be put back, and every other one was.", gone)
     end
-    log("The %d source(s) this script had muted are unmuted again - %s. Nothing you had muted yourself was ever touched by this, so anything still silent is silent because you silenced it.%s",
-        back + gone, why, tail)
+    log("The %d source(s) whose OBS audio track %d this script switched for the take are back to exactly the tracks you had - %s. That one track was the whole change: no fader was moved, nothing was muted, and the other five tracks carried what they always carry.%s",
+        back + gone, MAX_AUDIO_MIXES, why, tail)
     return back, gone
 end
 
 local function aud_isolate()
-    if st.aud_muted then
+    if st.aud_saved then
         aud_restore("a record from an earlier take was still open when this one started")
     end
+    st.aud_on = false
     if cfg.rec_sound ~= "source" then return 0 end
     if obs.obs_frontend_recording_active()
        or (obs.obs_frontend_streaming_active and obs.obs_frontend_streaming_active()) then
-        log("NOTHING WAS MUTED FOR THIS TAKE, because a recording or a stream of your own is running. 'Source only' silences every other source that carries audio, and doing that while your own output is running would silence your own output. A take is not supposed to be able to start at all in that state, so this line means one got through: the take is going ahead with OBS's audio mixer exactly as it stands, and your audio was left alone.")
+        log("NOTHING WAS TAKEN OFF AUDIO TRACK %d FOR THIS TAKE, because a recording or a stream of your own is running. 'Source only' clears every other audio source off that track for the length of a take, and doing that while your own output is running could take the sound out of a track your own output is writing. A take is not supposed to be able to start at all in that state, so this line means one got through: the take is going ahead with OBS's audio mixer exactly as it stands, and your track assignments were left alone.",
+            MAX_AUDIO_MIXES)
         return 0
     end
-    if obs.obs_source_set_muted == nil or obs.obs_source_muted == nil then
-        log("This OBS build's scripting API has no obs_source_set_muted, so 'Source only' cannot silence anything and this take carries whatever OBS's audio mixer carries. Nothing else about the take changes.")
+    if obs.obs_source_get_audio_mixers == nil or obs.obs_source_set_audio_mixers == nil then
+        log("This OBS build's scripting API has no obs_source_get_audio_mixers and obs_source_set_audio_mixers, so 'Source only' cannot clear audio track %d and this take carries whatever OBS's audio mixer carries - a microphone or a notification CAN land in it. Nothing else about the take changes.",
+            MAX_AUDIO_MIXES)
+        return 0
+    end
+    if aud_rec_mix_taken() then
+        log("NOTHING WAS TAKEN OFF AUDIO TRACK %d FOR THIS TAKE, because OBS's own recording output is set to use that track - read off that output, or out of your own output settings while that output has no track list yet, rather than assumed. 'Source only' needs track %d to itself, and clearing it would take the sound out of your own recording the moment you start one, so your track assignments were left alone and this take carries whatever OBS's audio mixer carries - a microphone or a notification CAN land in it. Free track %d under Settings -> Output if you want 'Source only' to work.",
+            MAX_AUDIO_MIXES, MAX_AUDIO_MIXES, MAX_AUDIO_MIXES)
         return 0
     end
     local list = aud_list_sources()
     if not list then
-        log("This OBS build's scripting layer does not provide obs_enum_sources, so the other audio sources cannot be found and 'Source only' cannot silence them. This take carries whatever OBS's audio mixer carries. Nothing else about the take changes.")
+        log("This OBS build's scripting layer does not provide obs_enum_sources, so the other audio sources cannot be found and 'Source only' cannot clear audio track %d. This take carries whatever OBS's audio mixer carries - a microphone or a notification CAN land in it. Nothing else about the take changes.",
+            MAX_AUDIO_MIXES)
         return 0
     end
-    local n = 0
+    local n, ours = 0, false
     for _, src in ipairs(list) do
         local nm = obs.obs_source_get_name(src)
         nm = nm and trim(nm) or ""
-        if nm ~= "" and nm ~= REC_SOURCE_NAME and aud_carries_audio(src) then
-            local okq, already = pcall(obs.obs_source_muted, src)
-            if okq and not already then
-                if pcall(obs.obs_source_set_muted, src, true) then
-                    st.aud_muted = st.aud_muted or {}
-                    st.aud_muted[#st.aud_muted + 1] = nm
-                    aud_write_record()
-                    n = n + 1
-                end
+        local mask = (nm ~= "" and aud_carries_audio(src)) and aud_mask_of(src) or nil
+        if mask then
+            local mine = (nm == REC_SOURCE_NAME)
+            if mine then ours = true end
+            local want = nil
+            if mine and not aud_has_rec_mix(mask) then
+                want = mask + REC_MIX_BIT
+            elseif (not mine) and aud_has_rec_mix(mask) then
+                want = mask - REC_MIX_BIT
+            end
+            if want and pcall(obs.obs_source_set_audio_mixers, src, want) then
+                st.aud_saved = st.aud_saved or {}
+                st.aud_saved[#st.aud_saved + 1] = { n = nm, m = mask }
+                aud_write_record()
+                if not mine then n = n + 1 end
             end
         end
     end
     aud_free_sources(list)
+    st.aud_on = true
+    if not ours then
+        log("THIS TAKE WILL HAVE NO SOUND IN IT. 'Source only' records OBS audio track %d and nothing else, and the recording source '%s' is not carrying audio at the moment the take starts, so nothing at all is feeding that track. The picture records normally and the file is playable. This is the setting doing what it says rather than a fault: choose 'Follow OBS audio mixer setting' if you would rather have the mix as it stands, microphone and all.",
+            MAX_AUDIO_MIXES, REC_SOURCE_NAME)
+    end
     return n
 end
 
@@ -2932,6 +3101,222 @@ local function hv_make_video_encoder(id, settings, label)
     return enc
 end
 
+local HV_VENC_ALIAS = {
+    x264        = { "obs_x264" },
+    x264_lowcpu = { "obs_x264" },
+    qsv         = { "obs_qsv11_v2", "obs_qsv11" },
+    qsv_av1     = { "obs_qsv11_av1" },
+    amd         = { "h264_texture_amf" },
+    amd_hevc    = { "h265_texture_amf" },
+    amd_av1     = { "av1_texture_amf" },
+    nvenc       = { "obs_nvenc_h264_tex", "jim_nvenc", "ffmpeg_nvenc" },
+    nvenc_hevc  = { "obs_nvenc_hevc_tex", "jim_hevc_nvenc", "ffmpeg_hevc_nvenc" },
+    nvenc_av1   = { "obs_nvenc_av1_tex", "jim_av1_nvenc", "jim_av1", "ffmpeg_av1_nvenc" },
+    apple_h264  = { "com.apple.videotoolbox.videoencoder.ave.avc" },
+    apple_hevc  = { "com.apple.videotoolbox.videoencoder.ave.hevc" },
+}
+
+local HV_AENC_ALIAS = {
+    aac  = { "ffmpeg_aac", "CoreAudio_AAC", "libfdk_aac" },
+    opus = { "ffmpeg_opus" },
+}
+
+local HV_PRESET_KEY = {
+    obs_x264           = { "Preset", "preset" },
+    obs_qsv11          = { "QSVPreset", "target_usage" },
+    obs_qsv11_v2       = { "QSVPreset", "target_usage" },
+    obs_qsv11_av1      = { "QSVPreset", "target_usage" },
+    h264_texture_amf   = { "AMDPreset", "preset" },
+    h265_texture_amf   = { "AMDPreset", "preset" },
+    av1_texture_amf    = { "AMDAV1Preset", "preset" },
+    obs_nvenc_h264_tex = { "NVENCPreset2", "preset2" },
+    obs_nvenc_hevc_tex = { "NVENCPreset2", "preset2" },
+    obs_nvenc_av1_tex  = { "NVENCPreset2", "preset2" },
+    jim_nvenc          = { "NVENCPreset2", "preset2" },
+    jim_hevc_nvenc     = { "NVENCPreset2", "preset2" },
+    jim_av1_nvenc      = { "NVENCPreset2", "preset2" },
+    ffmpeg_nvenc       = { "NVENCPreset2", "preset2" },
+    ffmpeg_hevc_nvenc  = { "NVENCPreset2", "preset2" },
+}
+
+local function hv_info_free(info)
+    if not info then return end
+    if info.venc_settings then obs.obs_data_release(info.venc_settings) end
+    if info.aenc_settings then obs.obs_data_release(info.aenc_settings) end
+    if info.out_settings then obs.obs_data_release(info.out_settings) end
+    info.venc_settings = nil
+    info.aenc_settings = nil
+    info.out_settings = nil
+end
+
+local function hv_enc_exists(id)
+    id = trim(id or "")
+    if id == "" then return false end
+    if obs.obs_encoder_get_display_name == nil then return true end
+    local ok, nm = pcall(obs.obs_encoder_get_display_name, id)
+    if not ok or nm == nil or trim(nm) == "" then return false end
+    return true
+end
+
+local function hv_resolve_enc(raw, alias)
+    raw = trim(raw or "")
+    if raw == "" or raw == "none" then return nil end
+    if hv_enc_exists(raw) then return raw end
+    local list = alias[raw]
+    if not list then return nil end
+    for _, id in ipairs(list) do
+        if hv_enc_exists(id) then return id end
+    end
+    return nil
+end
+
+local function hv_profile_dir(c)
+    local app = os.getenv("APPDATA")
+    if not app or trim(app) == "" then return nil end
+    local base = app .. "\\obs-studio\\basic\\profiles\\"
+    local names = {}
+    if obs.obs_frontend_get_user_config then
+        local ok, uc = pcall(obs.obs_frontend_get_user_config)
+        if ok and uc then names[#names + 1] = cfg_str(uc, "Basic", "ProfileDir") end
+    end
+    names[#names + 1] = cfg_str(c, "General", "Name")
+    for _, n in ipairs(names) do
+        if n ~= "" and read_file(base .. n .. "\\basic.ini") then
+            return base .. n
+        end
+    end
+    return nil
+end
+
+local function hv_json_settings(dir, file)
+    if not dir then return nil end
+    if obs.obs_data_create_from_json_file == nil then return nil end
+    local ok, d = pcall(obs.obs_data_create_from_json_file, dir .. "\\" .. file)
+    if not ok or not d then return nil end
+    return d
+end
+
+local function hv_rec_target(info)
+    if obs.obs_frontend_get_current_record_output_path then
+        local ok, p = pcall(obs.obs_frontend_get_current_record_output_path)
+        if ok and p then info.dir = trim(p) end
+    end
+    local c = prof_cfg()
+    if not c then return end
+    local fmt = cfg_str(c, out_section(c), "RecFormat2")
+    info.ext = HV_EXT[fmt] or ((fmt ~= "") and fmt or nil)
+end
+
+local function hv_out_shell(info)
+    local fout = obs.obs_frontend_get_recording_output()
+    if not fout then return "obs_frontend_get_recording_output() returned nothing" end
+    local oki, oid = pcall(obs.obs_output_get_id, fout)
+    if oki and oid then info.out_id = trim(oid) end
+    local oks, osd = pcall(obs.obs_output_get_settings, fout)
+    if oks and osd then info.out_settings = osd end
+    pcall(obs.obs_output_release, fout)
+    if not info.out_id or info.out_id == "" then
+        return "OBS's own recording output has no id"
+    end
+    return nil
+end
+
+local function hv_simple_vsettings(c, id)
+    local rate = cfg_int(c, "SimpleOutput", "VBitrate")
+    if rate <= 0 then return nil end
+    local d = obs.obs_data_create()
+    obs.obs_data_set_string(d, "rate_control", "CBR")
+    obs.obs_data_set_int(d, "bitrate", rate)
+    local pk = HV_PRESET_KEY[id]
+    if pk then
+        local pv = cfg_str(c, "SimpleOutput", pk[1])
+        if pv ~= "" then obs.obs_data_set_string(d, pk[2], pv) end
+    end
+    return d
+end
+
+local function hv_aenc_settings(rate)
+    if rate <= 0 then return nil end
+    local d = obs.obs_data_create()
+    obs.obs_data_set_int(d, "bitrate", rate)
+    return d
+end
+
+local function hv_read_config()
+    local c = prof_cfg()
+    if not c then
+        return nil, "this OBS build's scripting API cannot read your profile configuration", true
+    end
+    local mode = out_mode(c)
+    local info = { from = "config" }
+    local vraw, araw, tracks, arate = "", "", 0, 0
+
+    if mode == "Advanced" then
+        if cfg_str(c, "AdvOut", "RecType") ~= "Standard" then
+            return nil, "your Advanced output records through the custom FFmpeg type, which uses no encoder of OBS's own", false
+        end
+        local jf = "recordEncoder.json"
+        vraw = cfg_str(c, "AdvOut", "RecEncoder")
+        if vraw == "" or vraw == "none" then
+            vraw = cfg_str(c, "AdvOut", "Encoder")
+            jf = "streamEncoder.json"
+        end
+        araw = cfg_str(c, "AdvOut", "RecAudioEncoder")
+        if araw == "" or araw == "none" then
+            araw = cfg_str(c, "AdvOut", "AudioEncoder")
+        end
+        tracks = cfg_int(c, "AdvOut", "RecTracks")
+        info.venc_id = hv_resolve_enc(vraw, HV_VENC_ALIAS)
+        if info.venc_id then
+            info.venc_settings = hv_json_settings(hv_profile_dir(c), jf)
+            if not info.venc_settings then
+                return nil, string.format("your Advanced output's encoder '%s' keeps its settings in %s, which could not be read", info.venc_id, jf), true
+            end
+        end
+        arate = cfg_int(c, "AdvOut",
+            "Track" .. tostring((first_track(tracks) or 0) + 1) .. "Bitrate")
+    else
+        local q = cfg_str(c, "SimpleOutput", "RecQuality")
+        if q == "Lossless" then
+            return nil, "your Simple output's recording quality is Lossless, which uses no encoder of OBS's own", false
+        end
+        if q ~= "Stream" then
+            return nil, string.format("your Simple output's recording quality is '%s', and OBS holds the encoder settings for that as its own constants rather than as values in your configuration", (q ~= "") and q or "(not set)"), true
+        end
+        vraw = cfg_str(c, "SimpleOutput", "StreamEncoder")
+        araw = cfg_str(c, "SimpleOutput", "StreamAudioEncoder")
+        tracks = cfg_int(c, "SimpleOutput", "RecTracks")
+        arate = cfg_int(c, "SimpleOutput", "ABitrate")
+        info.venc_id = hv_resolve_enc(vraw, HV_VENC_ALIAS)
+        if info.venc_id then
+            info.venc_settings = hv_simple_vsettings(c, info.venc_id)
+            if not info.venc_settings then
+                return nil, "your Simple output carries no video bitrate to record at", true
+            end
+        end
+    end
+
+    if not info.venc_id then
+        hv_info_free(info)
+        return nil, string.format("your %s output's recording encoder is '%s', which this OBS build does not have",
+            mode, (vraw ~= "") and vraw or "(not set)"), true
+    end
+
+    info.aenc_id = hv_resolve_enc(araw, HV_AENC_ALIAS)
+    if info.aenc_id then
+        info.aenc_settings = hv_aenc_settings(arate)
+        info.aenc_mix = first_track(tracks)
+    end
+
+    hv_rec_target(info)
+    local shell = hv_out_shell(info)
+    if shell then
+        hv_info_free(info)
+        return nil, shell, true
+    end
+    return info, nil, true
+end
+
 -- obs_output_get_video_encoder returns a borrowed pointer
 -- an idle output's path is the previous recording's file
 local function hv_read_frontend()
@@ -2939,7 +3324,7 @@ local function hv_read_frontend()
     if not fout then
         return nil, "obs_frontend_get_recording_output() returned nothing"
     end
-    local info = {}
+    local info = { from = "output" }
     local ok_id, oid = pcall(obs.obs_output_get_id, fout)
     info.out_id = (ok_id and oid) or nil
 
@@ -2969,20 +3354,28 @@ local function hv_read_frontend()
         return nil, "the frontend recording output has no id"
     end
     if not info.venc_id or trim(info.venc_id) == "" then
+        hv_info_free(info)
         return nil, "the frontend video encoder has no id"
     end
+    hv_rec_target(info)
     return info, nil
 end
 
-local function hv_build_out_settings(src_settings)
-    if not src_settings then return nil, "the frontend recording output has no settings" end
-    local okj, js = pcall(obs.obs_data_get_json, src_settings)
-    if not okj or not js or trim(js) == "" then
-        return nil, "the frontend output settings could not be read as JSON"
+local function hv_build_out_settings(info)
+    local d = nil
+    if info.out_settings then
+        local okj, js = pcall(obs.obs_data_get_json, info.out_settings)
+        if okj and js and trim(js) ~= "" then
+            local okc, made = pcall(obs.obs_data_create_from_json, js)
+            if okc and made then d = made end
+        end
     end
-    local okc, d = pcall(obs.obs_data_create_from_json, js)
-    if not okc or not d then
-        return nil, "the frontend output settings could not be copied"
+    if not d then
+        local okn, made = pcall(obs.obs_data_create)
+        if okn and made then d = made end
+    end
+    if not d then
+        return nil, "the recording output's settings could not be copied"
     end
     local old = obs.obs_data_get_string(d, "path") or ""
     if trim(old) == "" then
@@ -2990,8 +3383,12 @@ local function hv_build_out_settings(src_settings)
     end
     local dir, ext = old:match("^(.*)[\\/][^\\/]*%.([%w]+)$")
     if not dir or not ext then
+        dir = trim(info.dir or "")
+        ext = trim(info.ext or "")
+    end
+    if dir == "" or ext == "" then
         obs.obs_data_release(d)
-        return nil, "no recording folder could be read off the frontend output (it has not recorded yet this profile)"
+        return nil, "no recording folder and file type could be read out of OBS's own output settings"
     end
     local vid = trim(st.video_id or "")
     if vid == "" then vid = "take" end
@@ -3039,6 +3436,7 @@ local function hv_try(info, venc_id, label)
     if info.aenc_id then
         local mix = math.floor(tonumber(info.aenc_mix or 0) or 0)
         if mix < 0 or mix >= MAX_AUDIO_MIXES then mix = 0 end
+        if st.aud_on then mix = REC_MIX_IDX end
         local oka, aenc = pcall(obs.obs_audio_encoder_create, info.aenc_id,
                                 "castika_rec_a_" .. label, info.aenc_settings,
                                 mix, nil)
@@ -3048,15 +3446,20 @@ local function hv_try(info, venc_id, label)
             if okb and au then
                 pcall(obs.obs_encoder_set_audio, aenc, au)
             end
-            log("This take's audio is taken from OBS audio track %d, the track OBS's own recording output is set to - read off that output's audio encoder rather than assumed. Everything routed to that track in Advanced Audio Properties is in the clip, which on a default install includes Desktop Audio and Mic/Aux.",
-                mix + 1)
+            if st.aud_on then
+                log("This take's audio is OBS audio track %d and nothing else. REC sound is 'Source only', so every other source that carries audio is off that track until a moment after the file closes: what is in the clip is the recording source, and what is NOT in it is your microphone, your desktop sound and any notification. The encoder is still OBS's own - its id and its settings are read off your recording output - and the track it draws from is the only part this script chose.",
+                    mix + 1)
+            else
+                log("This take's audio is taken from OBS audio track %d, the track OBS's own recording output is set to - read out of your own output settings rather than assumed. REC sound is 'Follow OBS audio mixer setting', so everything routed to that track in Advanced Audio Properties is in the clip, which on a default install includes Desktop Audio and Mic/Aux.",
+                    mix + 1)
+            end
         else
             log("The audio encoder '%s' could not be cloned, so this take records picture only.",
                 tostring(info.aenc_id))
         end
     end
 
-    local osettings, where = hv_build_out_settings(info.out_settings)
+    local osettings, where = hv_build_out_settings(info)
     if not osettings then return false, where end
 
     local oko, out = pcall(obs.obs_output_create, info.out_id,
@@ -3103,10 +3506,19 @@ local function hv_drop_output()
     end
 end
 
+local function hv_enc_plan()
+    local info, cwhy, primable = hv_read_config()
+    if info then return info, nil, true end
+    if primable == false then return nil, tostring(cwhy), false end
+    local fnfo, fwhy = hv_read_frontend()
+    if fnfo then return fnfo, nil, true end
+    return nil, string.format("%s, and %s", tostring(cwhy), tostring(fwhy)), true
+end
+
 local function hv_start(why)
     if hv_active() then return true end
     if st.hv_view or st.hv_output then
-        log("The previous take's output is still finalizing, so this one records through OBS's own recording path instead.")
+        log("The previous take's output has not finished closing its file yet, so this one could not be started.")
         return false
     end
 
@@ -3114,7 +3526,7 @@ local function hv_start(why)
     if not ok then
         if not st.hv_api_warned then
             st.hv_api_warned = true
-            log("This OBS build has no %s, so recordings cannot be made from this script's own view and go through OBS's recording path at the canvas size instead. Nothing else changes.",
+            log("This OBS build has no %s, so this script cannot record from a view of its own at all. Every take needs that view - it is what gives the file the source's own size and keeps the Program output and the on-screen card out of it - so no take can run on this build.",
                 tostring(missing))
         end
         return false
@@ -3122,33 +3534,31 @@ local function hv_start(why)
 
     local w, h = hv_want_size()
     if not w then
-        log("The recording source has no size yet, so this take goes through OBS's own recording path (%s).", why)
+        log("The recording source has no size yet, so there was nothing to record (%s). The page has not finished laying itself out; take the source off Program for a moment and put it back.", why)
         return false
     end
     st.hv_size = { w = w, h = h }
 
-    local info, why_not = hv_read_frontend()
+    local info, why_not = hv_enc_plan()
     if not info then
-        log("The recording encoder could not be read off OBS's own recording output (%s), so this take goes through OBS's recording path at the canvas size. Start a recording in OBS once and this script can inherit its encoder from then on.",
-            tostring(why_not))
+        log("The recording encoder could not be assembled (%s).", tostring(why_not))
         st.hv_size = nil
         return false
     end
 
     local made, mwhy = hv_make_view(w, h)
     if not made then
-        log("The hidden view could not be built (%s), so this take goes through OBS's own recording path.", tostring(mwhy))
+        log("This script's own recording view could not be built (%s).", tostring(mwhy))
         hv_release_all()
-        if info.venc_settings then obs.obs_data_release(info.venc_settings) end
-        if info.aenc_settings then obs.obs_data_release(info.aenc_settings) end
-        if info.out_settings then obs.obs_data_release(info.out_settings) end
+        hv_info_free(info)
         return false
     end
 
-    local started, swhy = hv_try(info, info.venc_id, "inherited")
+    local label = (info.from == "config") and "configured" or "inherited"
+    local started, swhy = hv_try(info, info.venc_id, label)
     if not started then
-        log("The inherited encoder '%s' would not start against this script's own view (%s).",
-            tostring(info.venc_id), tostring(swhy))
+        log("The %s encoder '%s' would not start against this script's own view (%s).",
+            label, tostring(info.venc_id), tostring(swhy))
         hv_drop_output()
         local alt = HV_NONTEX[info.venc_id or ""]
         if alt then
@@ -3163,12 +3573,10 @@ local function hv_start(why)
         end
     end
 
-    if info.venc_settings then obs.obs_data_release(info.venc_settings) end
-    if info.aenc_settings then obs.obs_data_release(info.aenc_settings) end
-    if info.out_settings then obs.obs_data_release(info.out_settings) end
+    hv_info_free(info)
 
     if not started then
-        log("Nothing this script could build would record from its own view, so this take goes through OBS's recording path at the canvas size. The take is not lost - only the geometry is.")
+        log("Nothing this script could build would record from its own view, so there was nothing left to try.")
         hv_release_all()
         return false
     end
@@ -3189,6 +3597,127 @@ local function hv_stop()
     st.hv_stop_ms = 15000
 end
 
+local function take_refused(detail)
+    st.we_record = false
+    st.remaining_ms = nil
+    st.pending_stop = nil
+    st.pending_reason = nil
+    st.unmask_wait_ms = nil
+    st.fail_card_ms = FAIL_CARD_MS
+    aud_restore("no recording was made for this take, so there was nothing for the track isolation to hold")
+    log("NO RECORDING WAS MADE FOR THIS TAKE AND NOTHING WAS WRITTEN TO DISK (%s). This is a REFUSAL, not a crash and not anything you did wrong: the only thing this tool makes is a clip at the recording source's own size, with the player's chrome outside the frame and the audio narrowed to one track, and that needs a recording output of this script's own. It could not build one this time, so it stopped rather than quietly hand the take to OBS's own recording - that would have given you a file at the canvas size, with the Program output in it and the audio back to the full mixer, and you would only have found out when you opened it. Losing one take is cheaper than a wrong file mixed in among your quotes. The source has been LEFT ON PROGRAM and the trim range is untouched, so once the cause above is dealt with, take the source off Program for a moment and put it back to run the take again. Starting any recording in OBS yourself, once, also clears the commonest cause of this.",
+        detail)
+end
+
+local function hv_prime_blocked()
+    local rec, str = foreign_output_now()
+    if rec then return "a recording of your own is running" end
+    if str then return "a stream of your own is running" end
+    if obs.obs_frontend_replay_buffer_active
+       and obs.obs_frontend_replay_buffer_active() then
+        return "your replay buffer is running"
+    end
+    return nil
+end
+
+local function hv_prime_check()
+    if st.prime_phase then return end
+    if (st.prime_tries or 0) > 0 then return end
+
+    local info, why, primable = hv_read_config()
+    if info then
+        hv_info_free(info)
+        return
+    end
+    local cwhy = tostring(why)
+    local fnfo = hv_read_frontend()
+    if fnfo then
+        hv_info_free(fnfo)
+        return
+    end
+
+    st.prime_tries = 1
+    if primable == false then
+        st.prime_phase = "failed"
+        log("THE NEXT TAKE WILL BE REFUSED, and here is the warning ahead of it: %s. This script records through an output of its own so the file is the source's own size with nothing of the Program output in it, and that needs an encoder of OBS's own to clone. The output mode you have chosen does not use one, so there is nothing to clone and no test recording would produce one. Choose a recording quality or type that uses an encoder, under Settings -> Output, and this script works again.",
+            cwhy)
+        return
+    end
+    if obs.obs_frontend_recording_start == nil then
+        st.prime_phase = "failed"
+        log("THE NEXT TAKE WILL BE REFUSED: %s, and this OBS build's scripting API has no obs_frontend_recording_start, so this script cannot make the short test recording that would bring the encoder into existence. Start any recording in OBS yourself, once, and takes work for the rest of this OBS session.",
+            cwhy)
+        return
+    end
+    local blocked = hv_prime_blocked()
+    if blocked then
+        st.prime_phase = "failed"
+        log("THE NEXT TAKE WILL BE REFUSED: %s. This script would normally make a short test recording of its own here to bring the encoder into existence, and it did NOT, because %s. Starting a recording while your own output is running is not something this script will ever do. The take will be refused and nothing will be written. Start the next take once your own output has finished.",
+            cwhy, blocked)
+        return
+    end
+
+    st.prime_phase = "wait"
+    st.prime_ms = PRIME_WAIT_MS
+    st.fe_ours = true
+    st.fe_stop_asked = nil
+    log("A SHORT TEST RECORDING OF THIS SCRIPT'S OWN IS STARTING NOW, and it is deliberate: %s. OBS does not attach its recording encoder to its recording output until a recording has actually been started once, so on a freshly started OBS there is nothing for this script to clone. Starting one and stopping it again is what brings that encoder into existence, and from then on every take of this session inherits it. This runs HERE, at the moment the source went to Program - in front of the whole %ds run-up and seconds before the page asks for the real recording - so the take's own timing is not touched by it. It stops the instant the encoder appears, which is a fraction of a second, and the mask is still up so the picture in it is black.",
+            cwhy, RUNUP_SEC)
+    obs.obs_frontend_recording_start()
+end
+
+local function hv_prime_poll()
+    if st.prime_phase ~= "wait" and st.prime_phase ~= "stop" then return end
+    st.prime_ms = (st.prime_ms or 0) - TICK_MS
+
+    if st.prime_phase == "wait" then
+        local info = hv_read_frontend()
+        if info then
+            hv_info_free(info)
+            st.prime_phase = "stop"
+            st.prime_ms = PRIME_WAIT_MS
+            st.fe_stop_asked = true
+            if obs.obs_frontend_recording_stop then
+                pcall(obs.obs_frontend_recording_stop)
+            end
+            log("OBS's recording encoder now EXISTS on OBS's recording output - which is the condition this script was waiting for, read directly off that output rather than waited out on a guess - so the test recording has been asked to stop. Takes record from this script's own view from here on.")
+        elseif st.prime_ms <= 0 then
+            st.prime_phase = "stop"
+            st.prime_bad = true
+            st.prime_ms = PRIME_WAIT_MS
+            st.fe_stop_asked = true
+            if obs.obs_frontend_recording_stop then
+                pcall(obs.obs_frontend_recording_stop)
+            end
+            log("THE TEST RECORDING RAN FOR %dms AND OBS STILL PUT NO ENCODER ON ITS RECORDING OUTPUT, so it has been stopped and the next take will be REFUSED rather than written at the wrong size. The usual cause is that the recording could not start at all - no space on the recording drive, a recording folder that is gone or not writable, or an encoder your hardware will not open. Check Settings -> Output and the OBS log just above this line, then reload this script to let it try again.",
+                PRIME_WAIT_MS)
+        end
+        return
+    end
+
+    if not obs.obs_frontend_recording_active() then
+        st.prime_phase = st.prime_bad and "failed" or "done"
+        st.fe_ours = nil
+        st.fe_stop_asked = nil
+        if st.prime_bad then return end
+        local last = ""
+        if obs.obs_frontend_get_last_recording then
+            local okl, p = pcall(obs.obs_frontend_get_last_recording)
+            if okl and p then last = trim(p) end
+        end
+        log("THE TEST RECORDING IS FINISHED AND IT LEFT A FILE BEHIND, which you did not ask for: %s. That file is this script's litter, not your footage - it is a fraction of a second long and the picture in it is the black mask - and you can delete it whenever you like. THIS SCRIPT DID NOT DELETE IT, on purpose: it sits in your own recording folder alongside your real recordings, nothing in this tool is allowed to delete a file in there, and OBS may still be remuxing it for a moment after it reports the stop. Nothing else of yours was touched: no setting was changed and your recording folder, format and encoder are exactly as you had them.",
+            (last ~= "") and last or "OBS did not report the file name, so look for the newest file in your recording folder with this moment's timestamp")
+        return
+    end
+    if st.prime_ms <= 0 then
+        st.prime_phase = st.prime_bad and "failed" or "done"
+        st.fe_ours = nil
+        st.fe_stop_asked = nil
+        log("The test recording did not report itself stopped within %dms. OBS closes the file on its own and whatever it wrote is in your recording folder for you to delete. Nothing is held up by this: whether the next take can run is decided by whether the encoder exists, and that is read fresh each time.",
+            PRIME_WAIT_MS)
+    end
+end
+
 local function hv_poll()
     if st.hv_frames_ms and st.hv_output then
         st.hv_frames_ms = st.hv_frames_ms - TICK_MS
@@ -3197,9 +3726,9 @@ local function hv_poll()
             local okf, n = pcall(obs.obs_output_get_total_frames, st.hv_output)
             local frames = (okf and tonumber(n)) or 0
             if frames <= 0 then
-                log("THIS SCRIPT'S OWN RECORDING OUTPUT STARTED AND THEN ENCODED NOTHING - no frame reached it in four seconds - so it is being stopped and the take is handed to OBS's own recording path instead. The file it opened is empty and can be deleted. An empty file is the one outcome this path is not allowed to produce silently, so this line exists to make it loud.")
+                log("THIS SCRIPT'S OWN RECORDING OUTPUT STARTED AND THEN ENCODED NOTHING - no frame reached it in four seconds - so it is being stopped and this take is over. The file it opened is empty and can be deleted; its name is in the 'Recording to' line above. An empty file is the one outcome this path is not allowed to produce silently, so this line exists to make it loud.")
                 hv_stop()
-                obs.obs_frontend_recording_start()
+                take_refused("this script's own recording output encoded no frame at all in its first four seconds")
             end
         end
     end
@@ -3231,6 +3760,11 @@ local function rec_card_canvas()
     return 1920, 1080
 end
 
+local REC_FAIL_TXT =
+    "  ! NO RECORDING - TAKE REFUSED  \n" ..
+    "  nothing was written to disk  \n" ..
+    "  see the script log for why  "
+
 local function rec_card_text()
     local w, h = 0, 0
     if st.hv_size then w, h = st.hv_size.w, st.hv_size.h end
@@ -3243,10 +3777,19 @@ local function rec_card_text()
 end
 
 -- text_gdiplus_v3 draws a 27x7 box for text "", not nothing
-local function rec_card_look(d, txt)
+local function rec_card_look(d, txt, fail)
     local live = (txt ~= "")
     obs.obs_data_set_string(d, "text", txt)
+    if fail then
+        obs.obs_data_set_int(d, "color", 0xFFFFFFFF)
+        obs.obs_data_set_int(d, "bk_color", 0xFF0000FF)
+        obs.obs_data_set_int(d, "bk_opacity", 100)
+        obs.obs_data_set_bool(d, "outline", true)
+        obs.obs_data_set_int(d, "outline_opacity", 100)
+        return
+    end
     obs.obs_data_set_int(d, "color", live and 0xFFFFFFFF or 0x00FFFFFF)
+    obs.obs_data_set_int(d, "bk_color", 0xFF000000)
     obs.obs_data_set_int(d, "bk_opacity", live and 70 or 0)
     obs.obs_data_set_bool(d, "outline", live)
     obs.obs_data_set_int(d, "outline_opacity", live and 100 or 0)
@@ -3385,10 +3928,18 @@ end
 local function rec_card_update()
     local live = st.we_record and hv_active()
 
-    if st.we_record and not live and not st.rec_card_fe then
-        st.rec_card_fe = true
-        log("This take is recording through OBS's own recording path, which captures the Program output - so the on-screen REC card is left off for it. On that path the card WOULD be in the file, and an indicator is never allowed to change what is recorded.")
+    if st.fail_card_ms then
+        st.fail_card_ms = st.fail_card_ms - TICK_MS
+        local rec, str = foreign_output_now()
+        if live or rec or str or st.fail_card_ms <= 0 then
+            st.fail_card_ms = nil
+            if rec or str then
+                log("The red refusal card has been taken off Program because %s started. An indicator of this script's own is never left on screen while an output of yours is running, because it would be in your file. The refusal itself stands and its reason is in the lines above.",
+                    rec and "a recording of your own" or "a stream of your own")
+            end
+        end
     end
+    local failing = (st.fail_card_ms ~= nil) and not live
 
     if st.we_record and not live then
         st.rec_card_t0 = nil
@@ -3412,7 +3963,7 @@ local function rec_card_update()
         st.rec_card_n = nil
     end
 
-    local want = live and rec_card_text() or ""
+    local want = live and rec_card_text() or (failing and REC_FAIL_TXT or "")
     local owe_text = (want ~= st.rec_card_txt)
     local owe_report = live and (st.rec_card_n or 0) < 3
     if not owe_text and not owe_report then return end
@@ -3423,7 +3974,7 @@ local function rec_card_update()
     if owe_text then
         st.rec_card_txt = want
         local d = obs.obs_data_create()
-        rec_card_look(d, want)
+        rec_card_look(d, want, failing)
         obs.obs_source_update(src, d)
         obs.obs_data_release(d)
     end
@@ -3435,6 +3986,17 @@ local function rec_card_update()
     obs.obs_source_release(src)
 end
 
+local function program_scene_name()
+    local nm = nil
+    local cs = obs.obs_frontend_get_current_scene
+        and obs.obs_frontend_get_current_scene()
+    if cs then
+        nm = obs.obs_source_get_name(cs)
+        obs.obs_source_release(cs)
+    end
+    return nm
+end
+
 local function note_program_scene(nm)
     if not nm or nm == "" then return end
     if nm ~= st.prog_scene then
@@ -3442,6 +4004,10 @@ local function note_program_scene(nm)
         st.prog_scene = nm
     end
     if nm ~= REC_SCENE_NAME then st.prog_away_scene = nm end
+end
+
+local function latch_program_scene()
+    note_program_scene(program_scene_name())
 end
 
 local function return_program_scene()
@@ -3469,16 +4035,10 @@ local function return_program_scene()
             cur, want)
         return
     end
-    local busy = false
-    if obs.obs_frontend_recording_active and obs.obs_frontend_recording_active() then
-        busy = true
-    end
-    if obs.obs_frontend_streaming_active and obs.obs_frontend_streaming_active() then
-        busy = true
-    end
-    if busy then
-        log("The take has ended, but Program was NOT returned to '%s' because a recording or a stream of your own is running. Switching Program would be a real transition inside your output, which this script will not do. Switch back by hand when you are ready.",
-            want)
+    local rec, str = foreign_output_now()
+    if rec or str then
+        log("The take has ended, but Program was NOT returned to '%s' because %s is running. Switching Program would be a real transition inside your output, which this script will not do. Switch back by hand when you are ready. THIS IS ABOUT AN OUTPUT OF YOURS AND NEVER ABOUT THE TAKE: a take of this script's own records through an output of its own, and a recording this script has already asked OBS to stop does not count here either, so neither of those can hold Program on this scene.",
+            want, rec and "a recording of your own" or "a stream of your own")
         return
     end
     if obs.obs_frontend_set_current_scene == nil then
@@ -3506,30 +4066,29 @@ end
 local function do_start_recording(why)
     st.playing_wait_ms = nil
     if recording_now() then
+        if st.prime_phase == "wait" or st.prime_phase == "stop" then
+            take_refused("this script's own short test recording had not finished by the time the page asked for this take")
+            return
+        end
         log("Already recording. Start request ignored (%s).", why)
         return
     end
 
     local silenced = aud_isolate()
     if silenced > 0 then
-        log("REC sound is 'Source only', so the %d other source(s) that carry audio are MUTED for the length of this take and unmuted the moment it ends - on a default install that is OBS's own Desktop Audio and Mic/Aux, which belong to no scene. IF YOUR MICROPHONE GOES QUIET WHEN A TAKE STARTS, THIS IS WHAT DID IT. A source you had already muted yourself is left alone and is still muted afterward. The list is written into this script's settings as each one is muted, by the same save that writes the mute itself, so if OBS stops before the take ends the next load unmutes them and says so.",
-            silenced)
+        log("REC sound is 'Source only', so the %d other source(s) that carry audio have OBS audio track %d turned off for the length of this take and turned back on a second or two after the file closes - on a default install that is OBS's own Desktop Audio and Mic/Aux, which belong to no scene. NOTHING IS MUTED AND NO FADER IS MOVED: one track per source is the whole change, and your other tracks carry exactly what they always carried, so your own monitoring and your own recording are unaffected. If you open Advanced Audio Properties during a take you will see track %d unticked on those sources, and it is ticked again on its own. The list of what was changed, each with the tracks it had, is written into this script's settings as each one is changed, so if OBS stops before the restore the next load puts them back and says so.",
+            silenced, MAX_AUDIO_MIXES, MAX_AUDIO_MIXES)
     end
 
     if not hv_start(why) then
-        if obs.obs_frontend_recording_start == nil then
-            aud_restore("the take could not be started at all")
-            log("NO RECORDING WAS STARTED (%s). The hidden-view path could not run and this OBS build's scripting API has no obs_frontend_recording_start to fall back to, so there is no way left to open a file. Anything this script had just muted for the take has been unmuted again.",
-                why)
-            return
-        end
-        obs.obs_frontend_recording_start()
+        take_refused(why)
+        return
     end
+    st.fail_card_ms = nil
     st.we_record = true
     st.ret_armed = true
     st.rec_card_t0 = nil
     st.rec_card_n = nil
-    st.rec_card_fe = nil
     if cfg.max_duration_sec > 0 then
         st.remaining_ms = cfg.max_duration_sec * 1000
         log("Recording started (%s). Safety cutoff at %ds.", why, cfg.max_duration_sec)
@@ -3540,10 +4099,10 @@ local function do_start_recording(why)
 end
 
 local function do_stop_recording(reason)
-    aud_restore(string.format("the take ended (%s)", reason))
+    st.aud_delay_ms = AUD_RESTORE_MS
+    st.aud_delay_why = string.format("the take ended (%s), and this ran %dms behind that so the file was closed and finalized before any other audio could reach the track again", reason, AUD_RESTORE_MS)
     st.remaining_ms = nil
     st.rec_card_t0 = nil
-    rec_card_remove()
     if hv_active() then
         hv_stop()
         st.we_record = false
@@ -3554,10 +4113,11 @@ local function do_stop_recording(reason)
         st.we_record = false
         return
     end
-    if not st.we_record then
+    if not st.fe_ours then
         log("This script owns no recording, so it stopped nothing (%s). Whatever OBS still reports here is either a recording the user started, which is left alone, or one this script started and already stopped, which is still finalizing.", reason)
         return
     end
+    st.fe_stop_asked = true
     obs.obs_frontend_recording_stop()
     st.we_record = false
     log("Recording stopped (%s).", reason)
@@ -3614,7 +4174,8 @@ local function poll_events()
                     st.ended_refused_nonce = nil
                     st.ctl_shown_nonce = nil
                 elseif etype == "ctl_on" then
-                    local tseed = line:match("&t=([%d%.]+)")
+                    local tseed = line:match("&mark=([%d%.]+)")
+                                  or line:match("&t=([%d%.]+)")
                     st.ctl_shown_nonce = st.nonce
                     log("The trim controls are now drawn on the recording page (opened at %ss). They are a LAYER on that one page, not a second page, and the arm was one-shot: a reload makes them disappear because there is nothing left to consume. Choose IN and OUT and press CONFIRM TO OBS. They also disappear the instant this source goes to Program - that refusal is what keeps them out of every recording.",
                         tseed or "0")
@@ -3964,6 +4525,8 @@ local function tick()
         end
     end
 
+    hv_prime_poll()
+
     hv_poll()
 
     rec_card_update()
@@ -3971,6 +4534,16 @@ local function tick()
     if st.ret_armed and not st.we_record and not st.hv_output
        and not st.hv_view and not st.hv_running then
         return_program_scene()
+    end
+
+    if st.aud_delay_ms then
+        st.aud_delay_ms = st.aud_delay_ms - TICK_MS
+        if st.aud_delay_ms <= 0 then
+            local why = st.aud_delay_why
+            st.aud_delay_ms = nil
+            st.aud_delay_why = nil
+            aud_restore(why or "the take ended")
+        end
     end
 
     if not cfg.enabled then return end
@@ -3982,13 +4555,14 @@ local function tick()
     if st.apply_pending and st.port
        and not recording_now() and not ctl_layer_up() then
         local tgt = obs.obs_get_source_by_name(REC_SOURCE_NAME)
+        local live = false
         if tgt then
-            local live = obs.obs_source_active(tgt)
+            live = obs.obs_source_active(tgt)
             obs.obs_source_release(tgt)
-            if not live then
-                st.apply_pending = false
-                create_or_update_source()
-            end
+        end
+        if not live then
+            st.apply_pending = false
+            create_or_update_source()
         end
     end
 
@@ -3997,6 +4571,8 @@ local function tick()
         deliver_panel_url()
         auto_convert_source_url()
     end
+
+    latch_program_scene()
 
     local name = REC_SOURCE_NAME
     local src = obs.obs_get_source_by_name(name)
@@ -4039,6 +4615,7 @@ local function tick()
             st.pending_stop = nil
             st.pending_reason = nil
         end
+        hv_prime_check()
         st.seq_at_activate = st.last_seq
         st.playing_wait_ms = PLAYING_FALLBACK_MS
     elseif (not active) and st.prev_active then
@@ -4125,12 +4702,15 @@ end
 
 local function on_frontend_event(event)
     if event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED then
-        aud_restore("the recording stopped")
-        st.we_record = false
-        st.remaining_ms = nil
-        st.pending_stop = nil
-        st.pending_reason = nil
-        st.unmask_wait_ms = nil
+        local ours = st.fe_ours or st.fe_stop_asked
+        if not ours and not our_take_now() then
+            aud_restore("the recording stopped")
+            st.we_record = false
+            st.remaining_ms = nil
+            st.pending_stop = nil
+            st.pending_reason = nil
+            st.unmask_wait_ms = nil
+        end
     elseif event == obs.OBS_FRONTEND_EVENT_SCENE_CHANGED then
         local nowscene = obs.obs_frontend_get_current_scene()
         if nowscene then
@@ -4180,13 +4760,6 @@ function script_defaults(settings)
     obs.obs_data_set_default_int(settings, "cr_voff", 0)
     obs.obs_data_set_default_int(settings, "cr_color", 0xFFFFFFFF)
     obs.obs_data_set_default_int(settings, "cr_bg", 0x8C000000)
-    local crf = obs.obs_data_create()
-    obs.obs_data_set_string(crf, "face", "Arial")
-    obs.obs_data_set_int(crf, "size", 36)
-    obs.obs_data_set_int(crf, "flags", 0)
-    obs.obs_data_set_string(crf, "style", "Regular")
-    obs.obs_data_set_default_obj(settings, "cr_font", crf)
-    obs.obs_data_release(crf)
 end
 
 local function cap(props, field, text, warn)
@@ -4270,8 +4843,7 @@ function script_properties()
 
     obs.obs_properties_add_button(grp, "btn_open_control",
         "Open the trim controls", function(p2, prop)
-            local vid = video_id_from_source(REC_SOURCE_NAME)
-                        or trim(st.video_id) or ""
+            local vid = resolve_video_id() or ""
             local src = arm_control_layer(vid)
             if not src then return true end
             if obs.obs_frontend_open_source_interaction then
@@ -4444,6 +5016,8 @@ function script_update(settings)
         st.playing_wait_ms = nil
         remove_quiet(paths().go)
         st.go_written = nil
+        st.rec_card_t0 = nil
+        rec_card_remove()
         log("Script disabled. Auto-recording will not run.")
     elseif (not was_enabled) and cfg.enabled then
         st.prev_active    = false
@@ -4529,6 +5103,19 @@ function script_load(settings)
         obs.obs_data_set_string(settings, "nonce", st.nonce)
     end
 
+    local font_now = obs.obs_data_get_obj(settings, "cr_font")
+    if font_now then
+        obs.obs_data_release(font_now)
+    else
+        local crf = obs.obs_data_create()
+        obs.obs_data_set_string(crf, "face", cfg.cr_face)
+        obs.obs_data_set_int(crf, "size", cfg.cr_size)
+        obs.obs_data_set_int(crf, "flags", 0)
+        obs.obs_data_set_string(crf, "style", "Regular")
+        obs.obs_data_set_obj(settings, "cr_font", crf)
+        obs.obs_data_release(crf)
+    end
+
     adopt_existing_events()
 
     st.video_id = trim(obs.obs_data_get_string(settings, "video_id"))
@@ -4562,11 +5149,13 @@ function script_load(settings)
 
     local stale = aud_read_record(settings)
     if #stale > 0 then
-        st.aud_muted = stale
-        log("THIS SCRIPT STILL HAD %d SOURCE(S) MUTED FROM A TAKE THAT NEVER ENDED, so they are being unmuted now, before anything else. OBS stopped between the mute and the restore - a crash, a kill, or this script being reloaded mid-take - and this record is the whole reason your microphone is not still silent with nothing on screen to explain it. The record goes into this script's settings as each source is muted, which is the same save that writes the mute itself, so the two can never be on disk apart.",
-            #stale)
-        aud_restore("OBS stopped between the mute and the restore, and this was still on record when the script loaded", true)
+        st.aud_saved = stale
+        log("THIS SCRIPT STILL HAD AUDIO TRACK %d TURNED OFF ON %d SOURCE(S) FROM A TAKE THAT NEVER ENDED, so they are being put back now, before anything else. OBS stopped between the change and the restore - a crash, a kill, or this script being reloaded mid-take - and this record is the whole reason a source is not left off a track with nothing on screen to explain it. The record goes into this script's settings as each source is changed, and OBS writes that record and every source's track assignment into the same scene collection file in the same save, so the two can never be on disk apart.",
+            MAX_AUDIO_MIXES, #stale)
+        aud_restore("OBS stopped between the change and the restore, and this was still on record when the script loaded", true)
     end
+
+    latch_program_scene()
 
     obs.obs_frontend_add_event_callback(on_frontend_event)
     obs.timer_add(tick, TICK_MS)
