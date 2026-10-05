@@ -1,6 +1,6 @@
 # Castika Simple Browser Recorder
 
-![Trim controls](docs/screenshot.jpg)
+![Trim controls](docs/screenshot.png)
 
 An OBS script for news and commentary creators who need to quote video.
 
