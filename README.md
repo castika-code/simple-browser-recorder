@@ -1,5 +1,7 @@
 # Castika Simple Browser Recorder
 
+![Trim controls](docs/screenshot.jpg)
+
 An OBS script for news and commentary creators who need to quote video.
 
 Paste a URL, mark the exact in and out points while watching, and send the scene to Program. The script records that range from OBS itself, at the source's own size, without the player's controls or chrome in the picture, and with the source channel credited on screen. No download step, no second editor, no external tools.
