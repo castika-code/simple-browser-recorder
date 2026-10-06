@@ -25,8 +25,11 @@ The script creates the scene `Castika Record Browser Scene` the first time it lo
 3. Send `Castika Record Browser Scene` to Program. Recording starts on its own and stops at the out-point.
 
 While a take is running a `REC` banner sits in the top left of Program. It is a status display only and is never part of the file.
+
 ![settings](docs/screenshot2.png)
+
 ![Trim controls](docs/screenshot3.png)
+
 ## Settings
 
 | | |
