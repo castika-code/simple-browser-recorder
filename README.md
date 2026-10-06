@@ -1,4 +1,4 @@
-# Castika Simple Browser Recorder
+# Castika Simple Browser Source Recorder
 
 ![main screen shot](docs/screenshot1.png)
 
