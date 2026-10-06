@@ -6,7 +6,7 @@ An OBS script for news and commentary creators who need to quote video.
 
 Paste a URL, mark the exact in and out points while watching, and send the scene to Program. The script records that range from OBS itself, at the source's own size, without the player's controls or chrome in the picture, and with the source channel credited on screen. No download step, no second editor, no external tools.
 
-![Trim controls](docs/screenshot3.png)
+
 
 ## Requirements
 
@@ -25,7 +25,8 @@ The script creates the scene `Castika Record Browser Scene` the first time it lo
 3. Send `Castika Record Browser Scene` to Program. Recording starts on its own and stops at the out-point.
 
 While a take is running a `REC` banner sits in the top left of Program. It is a status display only and is never part of the file.
-
+![settings](docs/screenshot2.png)
+![Trim controls](docs/screenshot3.png)
 ## Settings
 
 | | |
@@ -38,7 +39,6 @@ While a take is running a `REC` banner sits in the top left of Program. It is a 
 
 Encoder, container, and output folder come from your OBS recording settings.
 
-![settings](docs/screenshot2.png)
 
 ## Known Limitations
 
