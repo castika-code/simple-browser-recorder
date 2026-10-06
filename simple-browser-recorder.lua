@@ -1,5 +1,5 @@
 -- Castika Simple Browser Recorder (Lua Script)
--- v0.9.2 - 2026-10-05
+-- v0.9.13 - 2026-10-06
 -- Copyright (c) 2026 Castika
 -- Licensed under the Apache License, Version 2.0
 -- https://github.com/Castika-Coce/simple-browser-recorder
@@ -7,6 +7,7 @@
 obs = obslua
 
 local TAG = "[YT Embed Rec]"
+local SCRIPT_VERSION = "v0.9.13 - 2026-10-06"
 local TICK_MS = 100
 local EVENT_POLL_EVERY = 1
 local DELIVERY_MS = 21 + 160 + (EVENT_POLL_EVERY * TICK_MS) + 107
@@ -92,6 +93,13 @@ local st = {
     server_launched = false,
     relaunch_ms     = nil,
     health_ms       = nil,
+    launch_want     = false,
+    launch_id       = nil,
+    owner_n         = 0,
+
+    create_want     = false,
+    create_want_logged = nil,
+    create_busy     = false,
 
     last_beat       = nil,
     beat_stale_ms   = 0,
@@ -127,6 +135,10 @@ local st = {
     ctl_shown_nonce = nil,
 
     ctl_audio       = false,
+
+    live_edge       = false,
+    live_edge_said  = nil,
+    stale_said      = nil,
 
     prog_scene      = nil,
     prog_prev_scene = nil,
@@ -278,6 +290,7 @@ local function paths()
         probe_req = join(d, "yt_probe_req.txt"),
         go     = join(d, "yt_go.flag"),
         ctl    = join(d, "yt_ctl.flag"),
+        owner  = join(d, "yt_owner.txt"),
     }
 end
 
@@ -429,6 +442,19 @@ local PLAYER_HTML = [==[
               fill:none;stroke-width:2.4;stroke-linecap:round;
               stroke-linejoin:round}
   #ctl button em{font-style:normal;font-size:.9em;white-space:nowrap}
+  .ctlgrp.ctli button,.ctlgrp.ctlo button{flex-direction:column;gap:.1em;
+              min-height:4.6em;padding:.3em .15em}
+  .ctlgrp.ctli button svg,.ctlgrp.ctlo button svg{width:2.1em;height:2.1em}
+  .ctlgrp.ctli button em,.ctlgrp.ctlo button em{font-size:.64em;line-height:1;
+              letter-spacing:.04em}
+  #ctl button#ctlhin.ctlon{background:#5bc8a6}
+  #ctl button#ctlhout.ctlon{background:#e0a04a}
+  #ctl button#ctlhin.ctldim{background:#5bc8a63d;color:#9fe3cd}
+  #ctl button#ctlhout.ctldim{background:#e0a04a3d;color:#f0cf9b}
+  #ctlmk{position:absolute;display:none;align-items:center;
+         justify-content:center;pointer-events:none;font-weight:bold;
+         line-height:1;white-space:nowrap;color:#36e2ff;
+         text-shadow:0 0 .12em #000,0 .05em .2em #000}
   #ctlmark{text-align:right;color:#8b96a3;opacity:.75;line-height:1.45}
   #ctlmark b{display:block;font-size:.5em;font-weight:600;letter-spacing:.14em;
              text-transform:uppercase}
@@ -439,6 +465,7 @@ local PLAYER_HTML = [==[
 <div id="win"><div id="player"></div><div id="cred"><span id="credt"></span></div></div>
 <div id="mask"><div id="prep"><div id="prepmsg"></div><div id="prepnum"></div></div></div>
 <div id="ctl">
+  <div id="ctlmk"></div>
   <div id="ctlpanel">
     <div id="ctlread">
       <div><b class="ctllab">PLAYER IS AT</b>
@@ -460,24 +487,26 @@ local PLAYER_HTML = [==[
     <div class="ctlrow">
       <div class="ctlgrp ctli">
         <div class="ctlbtns">
-          <button id="ctlim1" data-n="in,-1" title="IN -1s"><svg viewBox="0 0 24 24"><path d="M7 3H3v18h4"/><path d="M21 12H10"/><path d="M14 7l-4 5 4 5"/></svg><em>1S</em></button>
-          <button id="ctlimf10" data-n="in,-10f" title="IN -10 frames"><svg viewBox="0 0 24 24"><path d="M7 3H3v18h4"/><path d="M15 7l-5 5 5 5"/><path d="M21 7l-5 5 5 5"/></svg><em>10F</em></button>
-          <button id="ctlimf1" data-n="in,-1f" title="IN -1 frame"><svg viewBox="0 0 24 24"><path d="M7 3H3v18h4"/><path d="M18 7l-5 5 5 5"/></svg><em>1F</em></button>
-          <button id="ctlipf1" data-n="in,1f" title="IN +1 frame"><svg viewBox="0 0 24 24"><path d="M7 3H3v18h4"/><path d="M12 7l5 5-5 5"/></svg><em>1F</em></button>
-          <button id="ctlipf10" data-n="in,10f" title="IN +10 frames"><svg viewBox="0 0 24 24"><path d="M7 3H3v18h4"/><path d="M10 7l5 5-5 5"/><path d="M16 7l5 5-5 5"/></svg><em>10F</em></button>
-          <button id="ctlip1" data-n="in,1" title="IN +1s"><svg viewBox="0 0 24 24"><path d="M7 3H3v18h4"/><path d="M10 12h11"/><path d="M17 7l4 5-4 5"/></svg><em>1S</em></button>
+          <button id="ctlim1" data-n="in,-1" title="IN -1s"><svg viewBox="0 0 24 24"><path d="M19 12H5"/><path d="M11 6l-6 6 6 6"/></svg><em>1S</em></button>
+          <button id="ctlimf10" data-n="in,-10f" title="IN -10 frames"><svg viewBox="0 0 24 24"><path d="M11 6l-6 6 6 6"/><path d="M18 6l-6 6 6 6"/></svg><em>10F</em></button>
+          <button id="ctlimf1" data-n="in,-1f" title="IN -1 frame"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg><em>1F</em></button>
+          <button id="ctlhin" title="go to IN and zoom the slider to the range"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M15.5 15.5L20.5 20.5"/></svg><em>ZOOM</em></button>
+          <button id="ctlipf1" data-n="in,1f" title="IN +1 frame"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg><em>1F</em></button>
+          <button id="ctlipf10" data-n="in,10f" title="IN +10 frames"><svg viewBox="0 0 24 24"><path d="M6 6l6 6-6 6"/><path d="M13 6l6 6-6 6"/></svg><em>10F</em></button>
+          <button id="ctlip1" data-n="in,1" title="IN +1s"><svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg><em>1S</em></button>
         </div>
         <div class="ctlul"></div>
       </div>
       <div class="ctlgap"></div>
       <div class="ctlgrp ctlo">
         <div class="ctlbtns">
-          <button id="ctlom1" data-n="out,-1" title="OUT -1s"><svg viewBox="0 0 24 24"><path d="M17 3h4v18h-4"/><path d="M15 12H4"/><path d="M8 7l-4 5 4 5"/></svg><em>1S</em></button>
-          <button id="ctlomf10" data-n="out,-10f" title="OUT -10 frames"><svg viewBox="0 0 24 24"><path d="M17 3h4v18h-4"/><path d="M9 7l-5 5 5 5"/><path d="M15 7l-5 5 5 5"/></svg><em>10F</em></button>
-          <button id="ctlomf1" data-n="out,-1f" title="OUT -1 frame"><svg viewBox="0 0 24 24"><path d="M17 3h4v18h-4"/><path d="M12 7l-5 5 5 5"/></svg><em>1F</em></button>
-          <button id="ctlopf1" data-n="out,1f" title="OUT +1 frame"><svg viewBox="0 0 24 24"><path d="M17 3h4v18h-4"/><path d="M6 7l5 5-5 5"/></svg><em>1F</em></button>
-          <button id="ctlopf10" data-n="out,10f" title="OUT +10 frames"><svg viewBox="0 0 24 24"><path d="M17 3h4v18h-4"/><path d="M4 7l5 5-5 5"/><path d="M10 7l5 5-5 5"/></svg><em>10F</em></button>
-          <button id="ctlop1" data-n="out,1" title="OUT +1s"><svg viewBox="0 0 24 24"><path d="M17 3h4v18h-4"/><path d="M4 12h11"/><path d="M11 7l4 5-4 5"/></svg><em>1S</em></button>
+          <button id="ctlom1" data-n="out,-1" title="OUT -1s"><svg viewBox="0 0 24 24"><path d="M19 12H5"/><path d="M11 6l-6 6 6 6"/></svg><em>1S</em></button>
+          <button id="ctlomf10" data-n="out,-10f" title="OUT -10 frames"><svg viewBox="0 0 24 24"><path d="M11 6l-6 6 6 6"/><path d="M18 6l-6 6 6 6"/></svg><em>10F</em></button>
+          <button id="ctlomf1" data-n="out,-1f" title="OUT -1 frame"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg><em>1F</em></button>
+          <button id="ctlhout" title="go to OUT and zoom the slider to the range"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M15.5 15.5L20.5 20.5"/></svg><em>ZOOM</em></button>
+          <button id="ctlopf1" data-n="out,1f" title="OUT +1 frame"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg><em>1F</em></button>
+          <button id="ctlopf10" data-n="out,10f" title="OUT +10 frames"><svg viewBox="0 0 24 24"><path d="M6 6l6 6-6 6"/><path d="M13 6l6 6-6 6"/></svg><em>10F</em></button>
+          <button id="ctlop1" data-n="out,1" title="OUT +1s"><svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg><em>1S</em></button>
         </div>
         <div class="ctlul"></div>
       </div>
@@ -585,6 +614,12 @@ local PLAYER_HTML = [==[
   var ctlLitPP = null, ctlLitRG = null, ctlLitLP = null;
   var ctlDrag = false, ctlDragPlay = false, ctlSeekMs = 0;
   var ctlSeeded = false;
+  var ctlZoom = '';
+  var ctlLitZI = null, ctlLitZO = null;
+  var ctlMkTxt = '', ctlMkUntil = 0, ctlMkArmI = true, ctlMkArmO = true;
+  var ctlMkLit = '', ctlMkPhase = '', ctlMkPlayAfter = false, ctlMkMutedBy = false;
+  var CTLMKMS = 1000, CTLMKNEAR = 0.75, CTLMKH = 0.14;
+  var CTLZMPCT = 0.08, CTLZMMIN = 0.4;
   var curPad = OVER, curIW = 0, curIH = 0;
 
   // re-setting the iframe size attributes re-layouts even with identical numbers
@@ -908,9 +943,26 @@ local PLAYER_HTML = [==[
     if (!(v >= 0)) { v = 0; }
     return v;
   }
+  function ctlWin(){
+    var dur = (ctlDurV > 0) ? ctlDurV : 0;
+    if (!(dur > 0)) { return { a: 0, b: 0, w: 0 }; }
+    if (ctlZoom !== 'in' && ctlZoom !== 'out') { return { a: 0, b: dur, w: dur }; }
+    var i = (ctlIn > 0) ? ctlIn : 0;
+    var o = ctlOutV();
+    if (!(o > i)) { o = i; }
+    var m = (o - i) * CTLZMPCT;
+    if (!(m >= CTLZMMIN)) { m = CTLZMMIN; }
+    var a = i - m;
+    var b = o + m;
+    if (a < 0) { a = 0; }
+    if (b > dur) { b = dur; }
+    if (!(b > a)) { return { a: 0, b: dur, w: dur }; }
+    return { a: a, b: b, w: b - a };
+  }
   function ctlPct(t){
-    if (!(ctlDurV > 0)) { return 0; }
-    var p = (t / ctlDurV) * 100;
+    var w = ctlWin();
+    if (!(w.w > 0)) { return 0; }
+    var p = ((t - w.a) / w.w) * 100;
     if (!(p >= 0)) { p = 0; }
     if (p > 100) { p = 100; }
     return p;
@@ -1009,6 +1061,18 @@ local PLAYER_HTML = [==[
       win.style.transformOrigin = '0 0';
       win.style.transform = 'translate(' + tx + 'px,' + g + 'px) scale(' + s + ')';
     } catch (x) {}
+    try {
+      var mk = ctlE('ctlmk');
+      if (mk) {
+        var mh = Math.round(s * H), mf = Math.round(s * H * CTLMKH);
+        if (!(mf >= 8)) { mf = 8; }
+        mk.style.left = tx + 'px';
+        mk.style.top = g + 'px';
+        mk.style.width = Math.round(s * W) + 'px';
+        mk.style.height = mh + 'px';
+        mk.style.fontSize = mf + 'px';
+      }
+    } catch (x) {}
   }
   window.addEventListener('resize', layoutCtl);
 
@@ -1030,12 +1094,123 @@ local PLAYER_HTML = [==[
         ctlLitLP = ctlLoop;
         ctlE('ctlloop').classList.toggle('ctlon', ctlLoop);
       }
+      var zon = (ctlZoom === 'in' || ctlZoom === 'out');
+      var ki = (ctlZoom === 'in') ? 2 : (zon ? 1 : 0);
+      var ko = (ctlZoom === 'out') ? 2 : (zon ? 1 : 0);
+      if (ki !== ctlLitZI) {
+        ctlLitZI = ki;
+        ctlE('ctlhin').classList.toggle('ctlon', ki === 2);
+        ctlE('ctlhin').classList.toggle('ctldim', ki === 1);
+      }
+      if (ko !== ctlLitZO) {
+        ctlLitZO = ko;
+        ctlE('ctlhout').classList.toggle('ctlon', ko === 2);
+        ctlE('ctlhout').classList.toggle('ctldim', ko === 1);
+      }
     } catch (x) {}
+  }
+
+  function ctlMkPaint(){
+    var mk = ctlE('ctlmk');
+    if (!mk) { return; }
+    var on = ctlOn && !ctlDead && !goSeen && ctlMkTxt !== '';
+    if (on && ctlMkPhase === '') {
+      var now = 0;
+      try { now = Date.now(); } catch (x) { now = 0; }
+      if (now >= ctlMkUntil) { ctlMkTxt = ''; on = false; }
+    }
+    var key = on ? ctlMkTxt : '';
+    if (key === ctlMkLit) { return; }
+    ctlMkLit = key;
+    try {
+      mk.textContent = key;
+      mk.style.display = on ? 'flex' : 'none';
+    } catch (x) {}
+  }
+
+  function ctlMkClear(){
+    ctlMkTxt = '';
+    ctlMkUntil = 0;
+    ctlMkArmI = true;
+    ctlMkArmO = true;
+    ctlMkPhase = '';
+    ctlMkPlayAfter = false;
+    ctlMkMute(false);
+    ctlMkPaint();
+  }
+
+  function ctlMkMute(on){
+    if (!player) { return; }
+    if (on) {
+      if (ctlMkMutedBy || ctlMuted) { return; }
+      try { player.mute(); } catch (x) {}
+      ctlMkMutedBy = true;
+      return;
+    }
+    if (!ctlMkMutedBy) { return; }
+    ctlMkMutedBy = false;
+    if (ctlMuted) { return; }
+    try { player.unMute(); } catch (x) {}
+  }
+
+  function ctlMkBegin(phase, playAfter){
+    if (!ctlOn || ctlDead || goSeen) { return; }
+    ctlMkMute(true);
+    ctlMkPhase = phase;
+    ctlMkPlayAfter = playAfter ? true : false;
+    ctlMkTxt = (phase === 'start') ? 'Start Point' : 'End Point';
+    try { ctlMkUntil = Date.now() + CTLMKMS; } catch (x) { ctlMkUntil = 0; }
+  }
+
+  function ctlMkStep(){
+    if (ctlMkPhase === '') { return; }
+    var now = 0;
+    try { now = Date.now(); } catch (x) { now = 0; }
+    if (now < ctlMkUntil) { return; }
+    if (ctlMkPhase === 'end') {
+      ctlMkPhase = '';
+      ctlPos = ctlIn;
+      ctlSeekTo(ctlIn);
+      if (ctlLoop) { ctlMkBegin('start', true); }
+      else { ctlMkTxt = ''; ctlMkMute(false); }
+      return;
+    }
+    ctlMkPhase = '';
+    ctlMkTxt = '';
+    ctlMkMute(false);
+    if (ctlMkPlayAfter) {
+      ctlMkPlayAfter = false;
+      ctlPlay();
+    }
+  }
+
+  function ctlMkFire(txt){
+    if (!ctlOn || ctlDead || goSeen) { return; }
+    ctlMkTxt = txt;
+    try { ctlMkUntil = Date.now() + CTLMKMS; } catch (x) { ctlMkUntil = 0; }
+  }
+
+  function ctlSyncPlay(ps){
+    if (!ctlPlaying && ps === 1) { ctlPause(); }
+  }
+
+  function ctlMkWatch(a){
+    if (!(a >= 0) || !(ctlDurV > 0)) { return; }
+    var i = (ctlIn > 0) ? ctlIn : 0;
+    var o = ctlOutV();
+    var hi = (a >= i - FR * 0.5) && (a <= i + CTLMKNEAR);
+    var ho = (o > i) && (a >= o - FR * 0.5) && (a <= o + CTLMKNEAR);
+    if (!hi) { ctlMkArmI = true; }
+    if (!ho) { ctlMkArmO = true; }
+    if (!ctlPlaying || ctlRange || ctlMkPhase !== '') { return; }
+    if (hi && ctlMkArmI) { ctlMkArmI = false; ctlMkFire('Start Point'); }
+    if (ho && ctlMkArmO) { ctlMkArmO = false; ctlMkFire('End Point'); }
   }
 
   function ctlPaint(){
     var a = ctlAt();
     if (!ctlDrag && a >= 0) { ctlPos = a; }
+    ctlMkWatch(a);
     var o = ctlOutV();
     ctlBtnPaint();
     try {
@@ -1052,6 +1227,7 @@ local PLAYER_HTML = [==[
       bd.style.left = ctlPct(ctlIn) + '%';
       bd.style.width = (ctlPct(o) - ctlPct(ctlIn)) + '%';
     } catch (x) {}
+    ctlMkPaint();
   }
 
   function ctlHome(){
@@ -1078,18 +1254,18 @@ local PLAYER_HTML = [==[
         ctlState = ps;
         if (ps === 0) { ctlOnEnded(); }
       }
-      if (ctlRange && ctlPlaying) {
+      ctlSyncPlay(ps);
+      if (ctlRange && ctlPlaying && ctlMkPhase === '') {
         var a2 = ctlAt();
         var o2 = ctlOutV();
         if (a2 >= 0 && o2 > ctlIn && a2 >= o2) {
-          if (ctlLoop) {
-            ctlSeekTo(ctlIn);
-            ctlPos = ctlIn;
-          } else {
-            ctlPause();
-          }
+          ctlPause();
+          ctlPos = o2;
+          ctlSeekTo(o2);
+          ctlMkBegin('end', false);
         }
       }
+      ctlMkStep();
     }
     ctlPaint();
     ctlConfirmPaint();
@@ -1107,8 +1283,22 @@ local PLAYER_HTML = [==[
       ctlOut = cur;
     }
     ctlPause();
+    ctlMkClear();
     ctlPos = cur;
     ctlSeekTo(cur);
+    ctlConfirmPaint();
+    ctlPaint();
+  }
+
+  function ctlGoMark(which){
+    var dur = (ctlDurV > 0) ? ctlDurV : 0;
+    if (!(dur > 0)) { return; }
+    ctlPause();
+    ctlMkClear();
+    ctlZoom = (ctlZoom === which) ? '' : which;
+    var t = (which === 'in') ? ((ctlIn > 0) ? ctlIn : 0) : ctlOutV();
+    ctlPos = t;
+    ctlSeekTo(t);
     ctlConfirmPaint();
     ctlPaint();
   }
@@ -1129,10 +1319,12 @@ local PLAYER_HTML = [==[
     if (!sl || !(ctlDurV > 0)) { return -1; }
     var r = sl.getBoundingClientRect();
     if (!(r.width > 0)) { return -1; }
+    var w = ctlWin();
+    if (!(w.w > 0)) { return -1; }
     var x = ev.clientX - r.left;
     if (!(x >= 0)) { x = 0; }
     if (x > r.width) { x = r.width; }
-    return (x / r.width) * ctlDurV;
+    return w.a + (x / r.width) * w.w;
   }
 
   function ctlHandle(el, set){
@@ -1144,6 +1336,7 @@ local PLAYER_HTML = [==[
       ctlDrag = true;
       ctlDragPlay = ctlPlaying;
       ctlPause();
+      ctlMkClear();
       set(ctlTAt(ev), false);
       var move = function(e){
         var t = ctlTAt(e);
@@ -1231,8 +1424,13 @@ local PLAYER_HTML = [==[
       if (!player) { return; }
       try {
         if (ctlPlaying) { player.pauseVideo(); ctlPlaying = false; }
-        else {
-          if (ctlRange) { ctlPos = ctlIn; ctlSeekTo(ctlIn); }
+        else if (ctlRange) {
+          ctlPos = ctlIn;
+          ctlSeekTo(ctlIn);
+          player.pauseVideo();
+          ctlPlaying = false;
+          ctlMkBegin('start', true);
+        } else {
           player.playVideo();
           ctlPlaying = true;
         }
@@ -1242,6 +1440,7 @@ local PLAYER_HTML = [==[
     ctlBind('ctlmute', function(){
       if (!player) { return; }
       try {
+        ctlMkMutedBy = false;
         if (ctlMuted) { player.unMute(); ctlMuted = false; }
         else { player.mute(); ctlMuted = true; }
       } catch (x) {}
@@ -1255,6 +1454,8 @@ local PLAYER_HTML = [==[
       }
       ctlPaint();
     });
+    ctlBind('ctlhin', function(){ ctlGoMark('in'); });
+    ctlBind('ctlhout', function(){ ctlGoMark('out'); });
 
     ctlBind('ctlconfirm', function(){
       var pr = ctlSendPair();
@@ -1651,6 +1852,9 @@ param(
   [string]$ProbeReq = '',
   [string]$Go = '',
   [string]$Ctl = '',
+  [string]$Owner = '',
+  [string]$OwnerId = '',
+  [int]$OwnerGoneSec = 20,
   [int]$MaxHours = 12,
   [switch]$ProbeOnly,
   [string]$Vid = ''
@@ -1665,6 +1869,7 @@ if (-not $Beat)     { $Beat     = Join-Path $Root 'yt_beat.txt' }
 if (-not $ProbeReq) { $ProbeReq = Join-Path $Root 'yt_probe_req.txt' }
 if (-not $Go)       { $Go       = Join-Path $Root 'yt_go.flag' }
 if (-not $Ctl)      { $Ctl      = Join-Path $Root 'yt_ctl.flag' }
+if (-not $Owner)    { $Owner    = Join-Path $Root 'yt_owner.txt' }
 
 $script:SelfPath = $PSCommandPath
 if (-not $script:SelfPath) { $script:SelfPath = $MyInvocation.MyCommand.Definition }
@@ -1802,6 +2007,37 @@ function ctlAnswer($want) {
   }
 }
 
+$script:ownerVal = ''
+$script:ownerAt = Get-Date
+$script:ownerGone = $false
+function ownerLost() {
+  if (-not $OwnerId) { return '' }
+  $now = Get-Date
+  $txt = ''
+  try {
+    if (Test-Path -LiteralPath $Owner) {
+      $txt = ([string][System.IO.File]::ReadAllText($Owner)).Trim()
+    }
+  } catch {
+    return ''
+  }
+  if ($txt -ne '') {
+    $id = ([string][regex]::Match($txt, '^[^\r\n]*').Value).Trim()
+    if ($id -ne $OwnerId) {
+      return 'another OBS now owns the work folder, so this older server is standing down instead of appending to a shared event file beside it'
+    }
+  }
+  if ($txt -ne $script:ownerVal) {
+    $script:ownerVal = $txt
+    $script:ownerAt = $now
+    return ''
+  }
+  if (($now - $script:ownerAt).TotalSeconds -ge $OwnerGoneSec) {
+    return "the OBS that started this server stopped writing its owner file $OwnerGoneSec seconds ago, so that OBS is gone and this server is ending itself"
+  }
+  return ''
+}
+
 if ($ProbeOnly) {
   $ProgressPreference = 'SilentlyContinue'
   $script:seq = 0
@@ -1926,6 +2162,8 @@ while ($true) {
     beat $false
     checkProbeRequest
     if (Test-Path -LiteralPath $Stop) { break }
+    $lost = ownerLost
+    if ($lost -ne '') { say "exiting: $lost"; $script:ownerGone = $true; break }
     if ((Get-Date) -gt $deadline) { say 'max lifetime reached'; break }
   }
   if (-not $got) { break }
@@ -2017,6 +2255,9 @@ if (Test-Path -LiteralPath $Stop) {
                '" rmdir /s /q "' + $Root + '"'
     Start-Process -WindowStyle Hidden -FilePath 'cmd.exe' -ArgumentList $cleanup
   } catch {}
+} elseif ($script:ownerGone) {
+  say 'work folder kept: this server ended itself, so it deletes nothing that the next OBS will want'
+  if (Test-Path -LiteralPath $Beat) { try { Remove-Item -LiteralPath $Beat -Force } catch {} }
 } else {
   say 'work folder kept: a newer server owns it'
   if (Test-Path -LiteralPath $Beat) { try { Remove-Item -LiteralPath $Beat -Force } catch {} }
@@ -2041,15 +2282,26 @@ end
 local function write_assets()
     local p = paths()
     ensure_dir(p.dir)
-    if not write_file(p.html, PLAYER_HTML) then
-        log("Cannot write the player page: %s", p.html)
-        return false
+    if read_file(p.html) ~= PLAYER_HTML then
+        if not write_file(p.html, PLAYER_HTML) then
+            log("Cannot write the player page: %s", p.html)
+            return false
+        end
     end
-    if not write_file(p.ps1, SERVER_PS1) then
-        log("Cannot write the server script: %s", p.ps1)
-        return false
+    if read_file(p.ps1) ~= SERVER_PS1 then
+        if not write_file(p.ps1, SERVER_PS1) then
+            log("Cannot write the server script: %s", p.ps1)
+            return false
+        end
     end
     return true
+end
+
+local function close_launch_pipe()
+    local pipe = st.launch_pipe
+    if not pipe then return end
+    st.launch_pipe = nil
+    pcall(function() pipe:close() end)
 end
 
 local function start_server()
@@ -2078,13 +2330,17 @@ local function start_server()
     st.beat_dead = false
     st.beat_deferred = false
 
+    st.launch_id = tostring(os.time()) .. tostring(math.random(1000, 9999))
+    st.owner_n = 0
+    write_file(p.owner, st.launch_id .. "\r\n0\r\n")
+
     local ps_cmd = string.format(
         'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""%s"" ' ..
         '-PreferredPort %d -PortFile ""%s"" -Root ""%s"" -Events ""%s"" ' ..
         '-Stop ""%s"" -Log ""%s"" -Beat ""%s"" -ProbeReq ""%s"" -Go ""%s"" ' ..
-        '-Ctl ""%s""',
+        '-Ctl ""%s"" -Owner ""%s"" -OwnerId %s',
         p.ps1, st.last_port or 0, p.port, p.dir, p.events, p.stop, p.slog,
-        p.beat, p.probe_req, p.go, p.ctl)
+        p.beat, p.probe_req, p.go, p.ctl, p.owner, st.launch_id)
     local vbs = string.format(
         'Set sh = CreateObject("WScript.Shell")\r\nsh.Run "%s", 0, False\r\n', ps_cmd)
     if not write_file(p.vbs, vbs) then
@@ -2092,17 +2348,45 @@ local function start_server()
         return false
     end
 
-    -- os.execute goes through cmd.exe and OBS has no console, so a window flashes
-    os.execute(string.format('wscript.exe //B //Nologo "%s"', p.vbs))
+    -- per Lua 5.1 ref: io.popen does not wait
+    local launch = string.format('wscript.exe //B //Nologo "%s"', p.vbs)
+    close_launch_pipe()
+    local okp, pipe = pcall(io.popen, launch, "r")
+    if okp and pipe then
+        st.launch_pipe = pipe
+    else
+        os.execute(launch)
+        if not st.popen_said then
+            st.popen_said = true
+            log("The local server was started the blocking way, because io.popen was refused on this machine. os.execute hands the command to cmd.exe and WAITS for it to exit, and that wait is on the same thread OBS draws its menus with - it is why loading this script can sit for several seconds before the panel comes back. Nothing is wrong with the server; only the launch is slow. io.popen does the same launch without the wait and is tried first.")
+        end
+    end
     st.server_launched = true
     st.health_ms = 3000
     log("Local server starting (it picks its own port). Folder: %s", p.dir)
     return true
 end
 
+local function service_launch()
+    if not st.launch_want then return false end
+    st.launch_want = false
+    return start_server()
+end
+
+local function request_launch(why)
+    if st.launch_want then return end
+    st.launch_want = true
+    log("A local server launch is wanted (%s). It is NOT started from this script's 100ms tick: that tick runs on OBS's render thread, where one os.execute - which waits for cmd.exe to exit - was measured at 5,694ms against a 33ms frame budget and took OBS's whole window to 'not responding'. The launch therefore happens on the same thread OBS gives its own menus, at the next frontend event, which any scene change or output start or stop produces. If nothing is happening in OBS at all, switch scenes once, or open and close this script's settings, and it goes immediately.",
+        why)
+end
+
 local function stop_server()
     local p = paths()
+    close_launch_pipe()
     write_file(p.stop, "stop\r\n")
+    remove_quiet(p.owner)
+    st.launch_id = nil
+    st.launch_want = false
     remove_quiet(p.go)
     st.go_written = nil
     remove_quiet(p.ctl)
@@ -2110,7 +2394,7 @@ local function stop_server()
     st.server_launched = false
     st.health_ms = nil
     st.port_wait_ms = nil
-    log("Local server stop requested.")
+    log("Local server stop requested. The owner file is gone with it, so even if that stop file could not be written the server ends itself within its owner grace rather than outliving this OBS.")
 end
 
 local function check_server_health()
@@ -2380,7 +2664,15 @@ local function apply_browser_settings(data, page_url, w, h)
     obs.obs_data_set_string(data, "css", "")
 end
 
-local function ensure_rec_source()
+local function request_create(why)
+    st.create_want = true
+    if st.create_want_logged then return end
+    st.create_want_logged = true
+    log("The recording scene or its browser source does not exist yet (%s), and neither one is created from this script's 100ms tick. That tick runs on OBS's render thread and holds this script's lock while it runs. obs_scene_create on that thread can never finish: OBS hands the new scene to its Qt UI thread and waits for the answer, the UI thread then announces the scene to every script, and the Lua binding must take this script's lock to deliver that announcement - the lock the tick is holding while it waits. Each side waits for the other and OBS stops drawing. That is why a machine that had never run this script froze the moment a URL was pasted. The scene and the source are created on the UI thread instead: straight away when a setting in this script's panel changes, and otherwise at the next OBS frontend event, which any scene change or output start or stop produces.",
+        why or "reason not recorded")
+end
+
+local function ensure_rec_source(may_create)
     if obs.obs_scene_create == nil or obs.obs_source_create == nil
        or obs.obs_scene_add == nil then
         log("This OBS build is missing obs_scene_create / obs_source_create / obs_scene_add, so the recording scene and source cannot be created. Create a scene named '%s' with a browser source named '%s' in it by hand.",
@@ -2397,6 +2689,9 @@ local function ensure_rec_source()
             obs.obs_source_release(src)
             return nil
         end
+    elseif not may_create then
+        request_create("the browser source is not there")
+        return nil
     else
         local w, h = resolve_resolution()
         local d = obs.obs_data_create()
@@ -2421,6 +2716,8 @@ local function ensure_rec_source()
             log("A source named '%s' already exists but it is not a scene, so it was left alone and the recording source may not stay loaded. Rename or remove it.",
                 REC_SCENE_NAME)
         end
+    elseif not may_create then
+        request_create("the recording scene is not there")
     else
         local ok, made = pcall(obs.obs_scene_create, REC_SCENE_NAME)
         if ok and made then
@@ -2463,6 +2760,11 @@ local function ensure_rec_source()
     end
 
     if scene_src then obs.obs_source_release(scene_src) end
+
+    if src and scene then
+        st.create_want = false
+        st.create_want_logged = nil
+    end
 
     if made_source then
         log("Created the browser source '%s'.", REC_SOURCE_NAME)
@@ -2550,7 +2852,7 @@ local function forget_video_state(new_id)
     return true
 end
 
-local function create_or_update_source()
+local function create_or_update_source(may_create)
     if not st.port then
         return bail("noport",
             "No local server port yet. The settings are applied to the source as soon as the port arrives.")
@@ -2584,7 +2886,7 @@ local function create_or_update_source()
         log("The video's native size is not known yet, so the page URL carries no aspect and the player falls back to a full-width iframe: the top and bottom of the picture may be cropped. It is corrected as soon as the size arrives.")
     end
 
-    local existing = ensure_rec_source()
+    local existing = ensure_rec_source(may_create)
     if not existing then return false end
 
     local data = obs.obs_data_create()
@@ -2596,6 +2898,58 @@ local function create_or_update_source()
     if id_from == "panel" then st.yt_url_applied = panel_raw end
     log("Browser source '%s' updated (id: %s, %dx%d)", name, video_id, w, h)
     return true
+end
+
+local function service_create()
+    if not st.create_want or st.create_busy then return false end
+    if not st.coll_ready then
+        local cs = obs.obs_frontend_get_current_scene
+            and obs.obs_frontend_get_current_scene()
+        if not cs then
+            if not st.coll_said then
+                st.coll_said = true
+                log("The recording scene is NOT being created yet, because OBS has not finished loading its scene collection. A scene created in front of that load does not survive it: OBS then reads the saved collection, finds this name already taken by the one just made, and renames the SAVED one with a ' 2' on the end. That is where a duplicate scene comes from, and why another one appears on every launch after it - the renamed copy is saved in turn and collides again next time. Creation therefore waits until OBS says it has finished loading, which is a fraction of a second away, and then happens by itself with nothing to collide with. This line is said once per session.")
+            end
+            return false
+        end
+        obs.obs_source_release(cs)
+        st.coll_ready = true
+    end
+    if not cfg.enabled or recording_now() then return false end
+    if not resolve_video_id() then return false end
+    st.create_busy = true
+    local ok, src = pcall(ensure_rec_source, true)
+    st.create_busy = false
+    if not ok then error(src, 0) end
+    if not src then return false end
+    obs.obs_source_release(src)
+    st.apply_pending = true
+    return true
+end
+
+local function ctl_show_hold()
+    if st.show_held then return end
+    if obs.obs_source_inc_showing == nil then
+        log("THE TRIM CONTROLS WILL BE BLANK IN NORMAL MODE on this OBS build: its scripting API has no obs_source_inc_showing, so this script cannot tell OBS the recording source is visible while you trim. OBS's Interact window draws a source but does not mark it visible, and a browser source that is visible nowhere produces no frames - which is a blank window, not a broken page. Turn Studio Mode on and the preview marks it visible for you.")
+        return
+    end
+    local src = obs.obs_get_source_by_name(REC_SOURCE_NAME)
+    if not src then return end
+    local ok = pcall(obs.obs_source_inc_showing, src)
+    obs.obs_source_release(src)
+    if not ok then return end
+    st.show_held = true
+    log("The recording source is marked VISIBLE for the length of this trim session. OBS's Interact window renders a source but never marks it visible, and a browser source that is visible nowhere stops producing frames - which is why the trim controls came up blank in normal mode while Studio Mode drew them perfectly: Studio Mode's preview was doing this job. THIS DOES NOT PUT THE SOURCE ON PROGRAM. It stays off program, the controls keep drawing, and the mark is dropped the moment this source goes live, the controls come down, or the script unloads.")
+end
+
+local function ctl_show_drop()
+    if not st.show_held then return end
+    st.show_held = false
+    if obs.obs_source_dec_showing == nil then return end
+    local src = obs.obs_get_source_by_name(REC_SOURCE_NAME)
+    if not src then return end
+    pcall(obs.obs_source_dec_showing, src)
+    obs.obs_source_release(src)
 end
 
 local function arm_control_layer(video_id)
@@ -2626,7 +2980,7 @@ local function arm_control_layer(video_id)
     end
 
     st.ctl_audio = true
-    if not create_or_update_source() then
+    if not create_or_update_source(true) then
         st.ctl_audio = false
         return nil
     end
@@ -2642,6 +2996,7 @@ local function arm_control_layer(video_id)
         st.nonce)
     st.apply_pending = false
     st.ctl_shown_nonce = nil
+    ctl_show_hold()
 
     return obs.obs_get_source_by_name(REC_SOURCE_NAME)
 end
@@ -4063,6 +4418,28 @@ local function return_program_scene()
     end
 end
 
+local function request_return()
+    if st.ret_want then return end
+    st.ret_want = true
+    st.ret_armed = nil
+    if st.ret_want_said then return end
+    st.ret_want_said = true
+    log("Program is owed a return to the scene it was on before the take, and that switch is NOT made from this script's 100ms tick. The tick runs on OBS's render thread and the Lua binding holds this script's lock for the whole of it. obs_frontend_set_current_scene hands the switch to OBS's Qt UI thread over a connection that waits for the answer, and in NORMAL - non-Studio - mode the UI thread announces the change to every script before it answers; the Lua binding cannot deliver that announcement without the lock the tick is still holding. Each side waits for the other and OBS stops drawing, which is the freeze a first-run machine saw. Studio Mode takes a different path inside OBS that announces nothing while the render thread waits, which is the only reason this has never been seen on a machine that runs Studio Mode. The switch is therefore made on the same thread OBS gives its own menus: at the next OBS frontend event, which any scene change or output start or stop produces, or when a setting in this script's panel changes, or the moment the trim button is pressed - which is what the return exists to free. Program can therefore sit on this script's scene for a moment after a take instead of leaving at once. If nothing is happening in OBS at all, switch scenes once or press the trim button and it goes immediately. This line is said once per session.")
+end
+
+local function service_return()
+    if not st.ret_want or st.ret_busy then return false end
+    if st.we_record or st.hv_output or st.hv_view or st.hv_running then
+        return false
+    end
+    st.ret_want = nil
+    st.ret_busy = true
+    local ok, err = pcall(return_program_scene)
+    st.ret_busy = false
+    if not ok then error(err, 0) end
+    return true
+end
+
 local function do_start_recording(why)
     st.playing_wait_ms = nil
     if recording_now() then
@@ -4141,6 +4518,14 @@ local function watch_source_url()
     st.apply_pending = true
 end
 
+local function stale_page_refused(what)
+    local key = tostring(what) .. "/" .. tostring(st.nonce)
+    if st.stale_said == key then return end
+    st.stale_said = key
+    log("A '%s' report from the recording page WAS REFUSED AND NO TAKE WAS STARTED. This script has not seen one genuine activation of '%s' since it loaded, so the page that sent that report belongs to an earlier run: it was in the browser source before this script existed, and the nonce it quotes came back out of this script's own settings, which is why its events look like this script's own. A recording window reported by a page nobody put there is the one thing that must never start a take. Nothing was written. Take the source off program for a moment and put it back.",
+        tostring(what), REC_SOURCE_NAME)
+end
+
 local function poll_events()
     local p = paths()
     local data, nxt, reset = read_file_tail(p.events, st.ev_off)
@@ -4182,6 +4567,7 @@ local function poll_events()
                 elseif etype == "ctl_off" then
                     local cwhy = line:match("&why=([%w_]+)") or "?"
                     st.ctl_shown_nonce = nil
+                    ctl_show_drop()
                     if cwhy == "gate" then
                         log("The trim controls were taken down because this source went to PROGRAM. The page does that before it asks for anything to play, and it is one-way - the controls cannot come back in this page load even if another arm arrives. Anything you had selected and not confirmed is gone with them.")
                     else
@@ -4236,7 +4622,9 @@ local function poll_events()
                     local rstamp = line:match("^seq=%d+ t=([%d%:%.]+)")
                     log("Recording asked for %ss before the in-point, at position %ss, with the mask still up. Everything from here until the mask lifts is black on purpose: it is where OBS's own recording-start latency goes, so the first frame of CONTENT is the frame the page uncovers and not whichever frame OBS happened to open the file on.",
                         rhead or "?", rat or "?")
-                    if configured_source_on_program() then
+                    if not st.live_edge then
+                        stale_page_refused("recstart")
+                    elseif configured_source_on_program() then
                         st.preview_warned_nonce = nil
                         do_start_recording("in-point lead")
                         if recording_now() then
@@ -4275,7 +4663,9 @@ local function poll_events()
                                 head)
                         end
                     end
-                    if configured_source_on_program() then
+                    if not st.live_edge then
+                        stale_page_refused("visible")
+                    elseif configured_source_on_program() then
                         st.preview_warned_nonce = nil
                         do_start_recording("recording window open")
                     elseif st.preview_warned_nonce ~= st.nonce then
@@ -4425,7 +4815,7 @@ local function adopt_existing_events()
     if maxseq > 0 then
         st.last_seq = maxseq
         st.seq_at_activate = maxseq
-        log("Event file from the previous run found: %d earlier event(s) skipped (up to seq=%d).",
+        log("Event file from the previous run found: %d earlier event(s) skipped (up to seq=%d). SKIPPING IS THE WHOLE POINT OF THIS STEP and it never adopts anything: the file outlives OBS, every line in it was written by a page of an earlier run, and reading them as if they had just arrived is how a script reload would replay an end-of-take or a recording window that nobody asked for. The sequence number is the only thing taken from them. A take needs more than a matching nonce in any case - it needs one genuine activation of the recording source in THIS session - so nothing in this file can start one.",
             n, maxseq)
     end
 end
@@ -4437,8 +4827,13 @@ local function tick()
         st.relaunch_ms = st.relaunch_ms - TICK_MS
         if st.relaunch_ms <= 0 then
             st.relaunch_ms = nil
-            start_server()
+            request_launch("the heartbeat watchdog asked for a restart")
         end
+    end
+
+    if st.launch_id and st.tick_count % BEAT_CHECK_EVERY == 0 then
+        st.owner_n = (st.owner_n or 0) + 1
+        write_file(paths().owner, st.launch_id .. "\r\n" .. st.owner_n .. "\r\n")
     end
 
     if st.port_wait_ms then
@@ -4533,7 +4928,7 @@ local function tick()
 
     if st.ret_armed and not st.we_record and not st.hv_output
        and not st.hv_view and not st.hv_running then
-        return_program_scene()
+        request_return()
     end
 
     if st.aud_delay_ms then
@@ -4592,13 +4987,16 @@ local function tick()
                 name)
         end
     elseif active and not st.prev_active then
+        st.live_edge = true
         log("Source activated: '%s'", name)
         if st.ctl_shown_nonce and st.ctl_shown_nonce == st.nonce then
             log("THIS SOURCE WENT TO PROGRAM WITH THE TRIM CONTROLS STILL DRAWN. The page removes them the moment it learns the source is live, which it learns from a poll every 250ms, so they were on the program output for up to about a quarter of a second before they went. No recording this script starts can have captured them - a take begins on the page's own in-point report, which cannot be sent until that same poll has told the page it is live - and the source is set to refresh on activation, so OBS reloads the page here too. Nothing to do; this line exists so the log accounts for what you saw.")
             st.ctl_shown_nonce = nil
         end
+        ctl_show_drop()
         st.ret_scene = st.prog_away_scene
         st.ret_armed = nil
+        st.ret_want = nil
         if st.ctl_audio or st.apply_pending then
             local owed_audio = st.ctl_audio
             st.ctl_audio = false
@@ -4627,9 +5025,14 @@ local function tick()
     st.prev_active = active
 
     local go_want = nil
-    if active then
+    if active and st.live_edge then
         local n = trim(st.nonce or "")
         if n ~= "" and n ~= "0" then go_want = n end
+    end
+    if active and not st.live_edge and not st.live_edge_said then
+        st.live_edge_said = true
+        log("THE PROGRAM GATE IS BEING HELD SHUT for '%s' because this script has not seen one genuine activation of it yet. The source was on program when the script loaded, so whatever page is in it was loaded by an earlier run and this script's own nonce comes back out of its settings - which means an old page and a new one cannot be told apart by their events alone. Holding the gate shut is what stops a leftover page from running itself up and reporting a recording window this script would then record. TAKE THE SOURCE OFF PROGRAM FOR A MOMENT AND PUT IT BACK: that is the activation, and from then on everything behaves normally.",
+            name)
     end
     if go_want ~= st.go_written
        or (go_want and st.tick_count % BEAT_CHECK_EVERY == 0) then
@@ -4701,6 +5104,15 @@ local function tick()
 end
 
 local function on_frontend_event(event)
+    if event == obs.OBS_FRONTEND_EVENT_FINISHED_LOADING then
+        st.coll_ready = true
+    end
+    if event ~= obs.OBS_FRONTEND_EVENT_EXIT
+       and event ~= obs.OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN then
+        service_launch()
+        service_create()
+        service_return()
+    end
     if event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED then
         local ours = st.fe_ours or st.fe_stop_asked
         if not ours and not our_take_now() then
@@ -4722,6 +5134,7 @@ local function on_frontend_event(event)
             schedule_stop(STOP_REASON_SCENE, 0)
         end
     elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
+        ctl_show_drop()
         aud_restore("OBS is shutting down")
         hv_stop()
         hv_release_all()
@@ -4736,7 +5149,7 @@ local function on_frontend_event(event)
 end
 
 function script_description()
-    return "Castika Simple Browser Recorder (Lua Script)"
+    return "Castika Simple Browser Recorder (Lua Script) " .. SCRIPT_VERSION
 end
 
 function script_defaults(settings)
@@ -4843,9 +5256,10 @@ function script_properties()
 
     obs.obs_properties_add_button(grp, "btn_open_control",
         "Open the trim controls", function(p2, prop)
+            service_launch()
             local vid = resolve_video_id() or ""
             local src = arm_control_layer(vid)
-            if not src then return true end
+            if not src then service_return() return true end
             if obs.obs_frontend_open_source_interaction then
                 local ok = pcall(obs.obs_frontend_open_source_interaction, src)
                 if ok then
@@ -4860,6 +5274,7 @@ function script_properties()
                     REC_SOURCE_NAME)
             end
             obs.obs_source_release(src)
+            service_return()
             return true
         end)
 
@@ -5078,6 +5493,11 @@ function script_update(settings)
     end
 
     st.apply_pending    = true
+    st.create_want      = true
+
+    service_create()
+    service_launch()
+    service_return()
 end
 
 function script_save(settings)
@@ -5158,14 +5578,16 @@ function script_load(settings)
     latch_program_scene()
 
     obs.obs_frontend_add_event_callback(on_frontend_event)
+    log("Script loaded: %s (nonce %s).", SCRIPT_VERSION, st.nonce)
+
+    start_server()
+
     obs.timer_add(tick, TICK_MS)
     st.timer_on = true
-    log("Script loaded (nonce %s).", st.nonce)
-
-    st.relaunch_ms = 400
 end
 
 function script_unload()
+    ctl_show_drop()
     aud_restore("the script is being unloaded")
     hv_stop()
     hv_release_all()
