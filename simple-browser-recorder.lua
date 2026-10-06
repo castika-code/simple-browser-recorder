@@ -1,5 +1,5 @@
 -- Castika Simple Browser Recorder (Lua Script)
--- v0.9.13 - 2026-10-06
+-- v0.9.16 - 2026-10-07
 -- Copyright (c) 2026 Castika
 -- Licensed under the Apache License, Version 2.0
 -- https://github.com/Castika-Coce/simple-browser-recorder
@@ -7,7 +7,7 @@
 obs = obslua
 
 local TAG = "[YT Embed Rec]"
-local SCRIPT_VERSION = "v0.9.13 - 2026-10-06"
+local SCRIPT_VERSION = "v0.9.16 - 2026-10-07"
 local TICK_MS = 100
 local EVENT_POLL_EVERY = 1
 local DELIVERY_MS = 21 + 160 + (EVENT_POLL_EVERY * TICK_MS) + 107
@@ -2894,6 +2894,7 @@ local function create_or_update_source(may_create)
     obs.obs_source_update(existing, data)
     obs.obs_data_release(data)
     obs.obs_source_release(existing)
+    st.panel_wrote = nil
     st.url_live = trim(page_url)
     if id_from == "panel" then st.yt_url_applied = panel_raw end
     log("Browser source '%s' updated (id: %s, %dx%d)", name, video_id, w, h)
@@ -3043,7 +3044,10 @@ local function auto_convert_source_url()
     if recording_now() or on_program then return end
 
     local typed_here = (st.yt_url_applied ~= nil)
-                       and (trim(url) ~= st.yt_url_applied)
+    if st.panel_wrote and trim(url) == st.panel_wrote then
+        st.panel_wrote = nil
+        typed_here = false
+    end
     if trim(url) ~= (st.yt_url_applied or "") then
         st.yt_url_applied = trim(url)
         cfg.yt_url = trim(url)
@@ -3051,15 +3055,17 @@ local function auto_convert_source_url()
             obs.obs_data_set_string(script_settings, "yt_url", trim(url))
         end
     end
-    if typed_here and clear_trim_range() then
-        log("A URL was typed straight into the browser source, so the in and out points were cleared. Pasting an address by hand is starting over, and that is true even when it is the same video - the points were chosen against a previous pass and nothing here can tell which frames you still meant. Open the trim controls and choose them again. A URL applied from this script's own panel keeps them.")
-    end
-
     local t = parse_time_param(url)
-    if t ~= st.url_time_sec then st.runup_logged = nil end
+    local t_changed = (t ~= st.url_time_sec)
+    if t_changed then st.runup_logged = nil end
     st.url_time_sec = t
     if script_settings then
         obs.obs_data_set_double(script_settings, "url_time_sec", t or -1)
+    end
+    if typed_here and clear_trim_range() then
+        log("A URL was typed straight into the browser source, so the in and out points were cleared. Pasting an address by hand is starting over, and that is true even when it is the same video - the points were chosen against a previous pass and nothing here can tell which frames you still meant. Open the trim controls and choose them again. A URL applied from this script's own panel keeps them, unless its t= changed.")
+    elseif t_changed and clear_trim_range() then
+        log("The t= in the URL changed, so the in and out points were cleared. A new t is an explicit instruction to start somewhere else, and it arrived after the range that was stored, so it wins: the take now starts at the new t and runs to the end of the video. This is the same whichever way the URL arrived - the script's own panel and an address typed by hand behave alike here - so the start position can never be changed and then silently ignored. Open the trim controls to choose an out-point again.")
     end
     if t then
         log("URL t= detected: %ss. That is the DEFAULT IN-POINT: with no trim range stored, the recording starts there, the page is loaded %ds earlier and plays forward behind the mask, and the trim controls open with the in-mark on it and the out-mark at the end of the video. A range confirmed in the control window outranks it, because that is the later and more explicit choice. Clearing the t from the URL gives the whole video back.",
@@ -3098,6 +3104,7 @@ local function deliver_panel_url()
     obs.obs_data_release(sd)
     obs.obs_source_release(src)
     st.yt_url_applied = raw
+    st.panel_wrote = raw
     st.url_live = raw
     log("The URL from the script panel was written into the browser source's URL field, which is the one place this script reads the video from: %s",
         raw)
@@ -4341,6 +4348,14 @@ local function rec_card_update()
     obs.obs_source_release(src)
 end
 
+local function studio_mode_on()
+    if obs.obs_frontend_preview_program_mode_active == nil then return false end
+    if obs.obs_frontend_set_current_preview_scene == nil then return false end
+    if obs.obs_frontend_preview_program_trigger_transition == nil then return false end
+    local ok, on = pcall(obs.obs_frontend_preview_program_mode_active)
+    return (ok and on) and true or false
+end
+
 local function program_scene_name()
     local nm = nil
     local cs = obs.obs_frontend_get_current_scene
@@ -4396,7 +4411,8 @@ local function return_program_scene()
             want, rec and "a recording of your own" or "a stream of your own")
         return
     end
-    if obs.obs_frontend_set_current_scene == nil then
+    local studio = studio_mode_on()
+    if not studio and obs.obs_frontend_set_current_scene == nil then
         log("THE TAKE HAS ENDED AND PROGRAM WAS NOT RETURNED to '%s': this OBS build's scripting API has no obs_frontend_set_current_scene, so this script cannot switch Program at all. Switch it by hand to free the trim button.",
             want)
         return
@@ -4407,7 +4423,12 @@ local function return_program_scene()
             want)
         return
     end
-    pcall(obs.obs_frontend_set_current_scene, target)
+    if studio then
+        pcall(obs.obs_frontend_set_current_preview_scene, target)
+        pcall(obs.obs_frontend_preview_program_trigger_transition)
+    else
+        pcall(obs.obs_frontend_set_current_scene, target)
+    end
     obs.obs_source_release(target)
     if not st.ret_said then
         st.ret_said = true
@@ -4422,6 +4443,7 @@ local function request_return()
     if st.ret_want then return end
     st.ret_want = true
     st.ret_armed = nil
+    if studio_mode_on() then return end
     if st.ret_want_said then return end
     st.ret_want_said = true
     log("Program is owed a return to the scene it was on before the take, and that switch is NOT made from this script's 100ms tick. The tick runs on OBS's render thread and the Lua binding holds this script's lock for the whole of it. obs_frontend_set_current_scene hands the switch to OBS's Qt UI thread over a connection that waits for the answer, and in NORMAL - non-Studio - mode the UI thread announces the change to every script before it answers; the Lua binding cannot deliver that announcement without the lock the tick is still holding. Each side waits for the other and OBS stops drawing, which is the freeze a first-run machine saw. Studio Mode takes a different path inside OBS that announces nothing while the render thread waits, which is the only reason this has never been seen on a machine that runs Studio Mode. The switch is therefore made on the same thread OBS gives its own menus: at the next OBS frontend event, which any scene change or output start or stop produces, or when a setting in this script's panel changes, or the moment the trim button is pressed - which is what the return exists to free. Program can therefore sit on this script's scene for a moment after a take instead of leaving at once. If nothing is happening in OBS at all, switch scenes once or press the trim button and it goes immediately. This line is said once per session.")
@@ -4929,6 +4951,7 @@ local function tick()
     if st.ret_armed and not st.we_record and not st.hv_output
        and not st.hv_view and not st.hv_running then
         request_return()
+        if st.ret_want and studio_mode_on() then service_return() end
     end
 
     if st.aud_delay_ms then
