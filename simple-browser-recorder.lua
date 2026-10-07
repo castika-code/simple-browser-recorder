@@ -1,5 +1,5 @@
 -- Castika Simple Browser Recorder (Lua Script)
--- v0.9.16 - 2026-10-07
+-- v0.9.43 - 2026-10-07
 -- Copyright (c) 2026 Castika
 -- Licensed under the Apache License, Version 2.0
 -- https://github.com/Castika-Coce/simple-browser-recorder
@@ -7,7 +7,7 @@
 obs = obslua
 
 local TAG = "[YT Embed Rec]"
-local SCRIPT_VERSION = "v0.9.16 - 2026-10-07"
+local SCRIPT_VERSION = "v0.9.43 - 2026-10-07"
 local TICK_MS = 100
 local EVENT_POLL_EVERY = 1
 local DELIVERY_MS = 21 + 160 + (EVENT_POLL_EVERY * TICK_MS) + 107
@@ -19,14 +19,23 @@ local PLAYING_FALLBACK_MS = 6000 + (RUNUP_SEC * 1000) + UNMASK_DEADLINE_MS + 400
 local UNMASK_WAIT_MS = 6000
 local PORT_WAIT_MS = 8000
 
+local TICK_WARN_MS = 50
+local TICK_GUARD = { halt_ms = 1000, hits = 3, ui_ms = 1500 }
+
+-- per Lua 5.1 ref: package.config holds the separator
+local PLAT = { sep = (package.config or "\\"):sub(1, 1) }
+PLAT.win = (PLAT.sep == "\\")
+
 local BEAT_CHECK_EVERY = 10
 local BEAT_STALE_MS    = 12000
 local BEAT_SETTLE_MS   = 30000
 local BEAT_MAX_RECOVER = 3
 
-local STOP_REASON_SCENE = "scene transition"
-local STOP_REASON_ENDED = "video ended"
-local STOP_REASON_OUT   = "out-point reached"
+local STOP_REASON = {
+    scene = "scene transition",
+    ended = "video ended",
+    out   = "out-point reached",
+}
 
 local OUT_TAIL_MS = 300
 
@@ -53,7 +62,7 @@ local cfg = {
 
     rec_sound       = "source",
 
-    cr_on           = true,
+    cr_on           = false,
     cr_mode         = "yh",
     cr_text         = "",
     cr_face         = "Arial",
@@ -72,6 +81,17 @@ local cfg = {
 local st = {
     timer_on        = false,
     tick_count      = 0,
+
+    halted          = nil,
+    tick_fn         = nil,
+    slow_worst      = 0,
+    slow_said       = {},
+    slow_hits       = 0,
+    cfg_roots       = nil,
+    trim_want       = nil,
+    trim_busy       = nil,
+    hk_id           = nil,
+    hk_fn           = nil,
 
     prev_active     = nil,
     we_record       = false,
@@ -127,6 +147,7 @@ local st = {
     probe_asked_for = nil,
     aspect_warned_for = nil,
     url_time_sec    = nil,
+    url_time_id     = nil,
     runup_logged    = nil,
 
     url_warned      = nil,
@@ -182,7 +203,6 @@ local st = {
     aud_delay_ms    = nil,
     aud_delay_why   = nil,
 
-    -- hv_size stays last in this table; suites slice it as their end anchor
     hv_size         = nil,
 }
 
@@ -192,6 +212,61 @@ local script_settings = nil
 local function log(fmt, ...)
     local msg = (select("#", ...) > 0) and string.format(fmt, ...) or fmt
     obs.script_log(obs.LOG_INFO, TAG .. " " .. msg)
+end
+
+local function logw(fmt, ...)
+    local msg = (select("#", ...) > 0) and string.format(fmt, ...) or fmt
+    obs.script_log(obs.LOG_WARNING, TAG .. " " .. msg)
+end
+
+local function now_ms()
+    if obs.os_gettime_ns == nil then return nil end
+    local ok, ns = pcall(obs.os_gettime_ns)
+    if not ok or type(ns) ~= "number" then return nil end
+    return ns / 1000000
+end
+
+local function halt(where, err)
+    if st.halted then return end
+    st.halted = where or "an entry point"
+    logw("HALTED in %s: %s", st.halted, tostring(err))
+    logw("Every entry point of this script now returns at once and the 100ms timer is off, so this is printed one time instead of ten times a second. Nothing else in OBS is affected and a take already recorded is already on disk. Reload the script to run it again - the line above carries the stack, so send it along with the OBS log.")
+    if st.tick_fn then pcall(obs.timer_remove, st.tick_fn) end
+end
+
+-- per obs-scripting-lua.h: errors recur
+local function guard(where, fn, arg, strict)
+    if st.halted then return nil end
+    local tb = (debug and debug.traceback) or tostring
+    local t0 = now_ms()
+    local ok, res = xpcall(function() return fn(arg) end, tb)
+    if not ok then
+        halt(where, res)
+        return nil
+    end
+    local ms = t0 and (now_ms() - t0) or nil
+    if not ms then return res end
+    if ms > st.slow_worst then st.slow_worst = ms end
+    if strict and ms >= TICK_GUARD.halt_ms then
+        st.slow_hits = st.slow_hits + 1
+        if st.slow_hits >= TICK_GUARD.hits then
+            halt(where, string.format(
+                "it blocked for %.0fms, and that is the %d time. One pass is budgeted %dms and it runs on the thread OBS draws with, so OBS was frozen for that long each time. One slow pass can be the disk; this many is a blocking call.",
+                ms, st.slow_hits, TICK_MS))
+            return nil
+        end
+    end
+    if ms <= (strict and TICK_WARN_MS or TICK_GUARD.ui_ms) then return res end
+    if st.slow_said[where] then return res end
+    st.slow_said[where] = true
+    if strict then
+        logw("%s took %.0fms against a %dms budget. Worst seen so far %.0fms. This is printed once for each entry point. It is a warning, not a failure, and nothing has been stopped.",
+            where, ms, TICK_MS, st.slow_worst)
+    else
+        logw("%s took %.0fms. It does not run on the render thread, so there is no frame budget and nothing was dropped, but it runs where OBS draws its menus and OBS could not answer for that long. Reported once, well past anything normal: loading this script and opening its settings are expected to take a moment.",
+            where, ms)
+    end
+    return res
 end
 
 local function hv_active()
@@ -265,13 +340,19 @@ end
 
 local function join(dir, name)
     dir = trim(dir):gsub("[\\/]+$", "")
-    return dir .. "\\" .. name
+    return dir .. PLAT.sep .. name
 end
 
 local function default_work_dir()
-    local base = os.getenv("TEMP")
-    if not base or base == "" then base = os.getenv("TMP") end
-    if not base or base == "" then base = "C:\\Windows\\Temp" end
+    local base
+    if PLAT.win then
+        base = os.getenv("TEMP")
+        if not base or base == "" then base = os.getenv("TMP") end
+        if not base or base == "" then base = "C:\\Windows\\Temp" end
+    else
+        base = os.getenv("TMPDIR")
+        if not base or base == "" then base = "/tmp" end
+    end
     return join(base, "obs-yt-embed-recorder")
 end
 
@@ -281,6 +362,7 @@ local function paths()
         dir    = d,
         html   = join(d, "yt_player.html"),
         ps1    = join(d, "yt_server.ps1"),
+        pl     = join(d, "yt_server.pl"),
         vbs    = join(d, "yt_launch.vbs"),
         events = join(d, "yt_events.txt"),
         stop   = join(d, "yt_stop.flag"),
@@ -298,8 +380,8 @@ local function extract_youtube_id(url)
     url = trim(url)
     if url == "" then return nil end
     local pats = {
-        "youtu%.be/([%w_%-]+)",
         "[?&]v=([%w_%-]+)",
+        "youtu%.be/([%w_%-]+)",
         "/embed/([%w_%-]+)",
         "/shorts/([%w_%-]+)",
         "/live/([%w_%-]+)",
@@ -313,7 +395,6 @@ local function extract_youtube_id(url)
     return nil
 end
 
--- Lua 5.1 %d truncates
 local function num_str(v)
     v = tonumber(v) or 0
     if v < 0 then v = 0 end
@@ -411,17 +492,46 @@ local PLAYER_HTML = [==[
                height:.8em;margin:-.4em 0 0 -.06em;background:#0007;
                border-radius:.06em}
   #ctlsl .ctlh.ctldrag{outline:.14em solid #fff7}
+  #ctlph.ctldrag{outline:.14em solid #fff7;width:.3em;margin-left:-.15em}
   #ctlph{position:absolute;top:50%;width:.16em;height:2.5em;margin-top:-1.25em;
          margin-left:-.08em;background:#fff;border-radius:.08em;
          box-shadow:0 0 .3em #000c;pointer-events:none}
   #ctlph::before{content:"";position:absolute;left:50%;top:-.3em;
          margin-left:-.3em;border:.3em solid transparent;border-top-color:#fff}
+  #ctlkeys{display:flex;justify-content:space-between;align-items:center;
+           gap:1.2em;font-size:.6em;color:#8b96a3;letter-spacing:.06em;
+           margin:.15em .9em .1em}
+  #ctlkdrag,#ctlkplay{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #ctlkplay{flex:0 0 auto}
+  #ctlkeys b{display:inline-block;font-weight:700;letter-spacing:.1em;
+             margin-left:.6em;padding:.16em .45em;border-radius:.35em;
+             border:.1em solid transparent;line-height:1.15;
+             vertical-align:middle}
+  #ctlkeys b i{font-style:normal;opacity:.55;margin-right:.3em}
+  .ctlki{color:#5bc8a6} .ctlko{color:#e0a04a} .ctlkp{color:#e8edf2}
+  #ctlkeys b.ctlkon i{opacity:1}
+  #ctlkfree.ctlkon,#ctlkph.ctlkon{background:#e8edf224;border-color:#e8edf2}
+  #ctlkin.ctlkon{background:#5bc8a62e;border-color:#5bc8a6}
+  #ctlkout.ctlkon{background:#e0a04a2e;border-color:#e0a04a}
+  #ctlhk{font-size:.56em;color:#7c8794;letter-spacing:.06em;line-height:1.5;
+         margin:0 .9em .3em;text-align:left}
+  #ctlhk b{font-weight:700;color:#9aa6b3;letter-spacing:.09em}
+  #ctlsl.ctlaim{cursor:crosshair}
+  #ctlsl .ctlh.ctlarm{outline:.16em solid #fff;outline-offset:.08em;z-index:4}
+  #ctlsl.ctlwait{opacity:.4}
+  #ctlsl.ctlwait #ctlph{display:none}
 
   .ctlrow{display:flex;flex-wrap:wrap;align-items:flex-start;gap:.28em 0}
   .ctlgap{flex:0 0 auto;width:1.5em}
   .ctlgrp{flex:1 1 13em;min-width:0;display:flex;flex-direction:column;
           gap:.28em}
   .ctlbtns{display:flex;flex-wrap:wrap;gap:.22em}
+  #ctltake{margin-bottom:.1em}
+  #ctltake .ctlbtns{flex:1 1 auto}
+  #ctl #ctltake button{flex:1 1 auto;min-height:1.7em;padding:0}
+  #ctl #ctltake button svg{width:1.2em;height:1.2em}
+  #ctl button#ctltin{background:#5bc8a62e;color:#5bc8a6}
+  #ctl button#ctltout{background:#e0a04a2e;color:#e0a04a}
   .ctlul{height:.22em;border-radius:.11em;background:#8b96a3}
   .ctlgrp.ctli .ctlul{background:#5bc8a6}
   .ctlgrp.ctlo .ctlul{background:#e0a04a}
@@ -484,6 +594,19 @@ local PLAYER_HTML = [==[
       <div class="ctlh" id="ctlho" title="OUT" style="left:100%"></div>
       <div id="ctlph" title="playhead" style="left:0%"></div>
     </div>
+    <div class="ctlrow" id="ctltake">
+      <div class="ctlgrp">
+        <div class="ctlbtns">
+          <button id="ctltin" title="take the playhead position as IN"><svg viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 20h16"/></svg></button>
+        </div>
+      </div>
+      <div class="ctlgap"></div>
+      <div class="ctlgrp">
+        <div class="ctlbtns">
+          <button id="ctltout" title="take the playhead position as OUT"><svg viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 20h16"/></svg></button>
+        </div>
+      </div>
+    </div>
     <div class="ctlrow">
       <div class="ctlgrp ctli">
         <div class="ctlbtns">
@@ -520,13 +643,24 @@ local PLAYER_HTML = [==[
       <div class="ctlgap"></div>
       <div class="ctlgrp">
         <div class="ctlbtns">
-          <button id="ctlprange" title="range: confine playback to the in-out range"><svg viewBox="0 0 24 24"><path d="M4 3v18"/><path d="M20 3v18"/><path d="M7 12h10"/></svg></button>
+          <button id="ctlprange" title="range: confine playback to the in-out range"><svg viewBox="0 0 24 24"><path d="M4 4v16"/><path d="M20 4v16"/><path d="M8 12h.01"/><path d="M12 12h.01"/><path d="M16 12h.01"/></svg></button>
           <button id="ctlloop" class="ctlon" title="loop: at the end, start again instead of stopping"><svg viewBox="0 0 24 24"><path d="M4 12V9a3 3 0 013-3h13"/><path d="M17 3l3 3-3 3"/><path d="M20 12v3a3 3 0 01-3 3H4"/><path d="M7 21l-3-3 3-3"/></svg></button>
           <button id="ctlmute" title="sound"><svg viewBox="0 0 24 24"><path d="M5 9v6h4l5 4V5L9 9z"/><path d="M17 9a4 4 0 010 6"/></svg></button>
           <button id="ctlconfirm" class="ctlgo" title="confirm to OBS"><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg><em>CONFIRM TO OBS</em></button>
         </div>
       </div>
     </div>
+    <div id="ctlkeys">
+      <div id="ctlkdrag">CLICK THE BAR TO MOVE:
+        <b id="ctlkfree" class="ctlkp"><i>1</i> NORMAL</b>
+        <b id="ctlkin" class="ctlki"><i>2</i> IN</b>
+        <b id="ctlkout" class="ctlko"><i>3</i> OUT</b>
+        <b id="ctlkph" class="ctlkp"><i>4</i> PLAYHEAD</b></div>
+      <div id="ctlkplay"><b class="ctlkp"><i>SPACE</i> PLAY / PAUSE</b></div>
+    </div>
+    <div id="ctlhk">OPEN THIS WINDOW INSTANTLY FROM A HOTKEY -
+      ASSIGN ONE IN OBS <b>SETTINGS &gt; HOTKEYS</b> UNDER
+      <b>CASTIKA - OPEN THE TRIM CONTROLS</b></div>
     <div id="ctlmark"><b>Castika Simple Browser Recorder</b>
       <i>Copyright (c) 2026 Castika - Licensed under the Apache License, Version 2.0</i></div>
   </div>
@@ -612,14 +746,25 @@ local PLAYER_HTML = [==[
   var ctlLoop = true, ctlRange = false;
   var ctlPlaying = false, ctlMuted = true, ctlState = -99;
   var ctlLitPP = null, ctlLitRG = null, ctlLitLP = null;
-  var ctlDrag = false, ctlDragPlay = false, ctlSeekMs = 0;
+  var ctlDrag = false, ctlDragPlay = false, ctlSeekMs = 0, ctlMoved = false;
   var ctlSeeded = false;
+  var ctlMode = 'free';
+  var ctlPrevAt = 0, ctlPrevWho = '', ctlPrevEnd = -1, ctlPrevBack = -1;
+  var ctlWantT = -1, ctlWantMs = 0;
+  var ctlPrevFrom = -1;
+  var ctlKickAt = 0, ctlKickOn = false, ctlDurTold = false;
+  var ctlKickAt = 0, ctlKickOn = false, ctlDurTold = false;
   var ctlZoom = '';
+  var ctlZA = -1, ctlZB = -1;
   var ctlLitZI = null, ctlLitZO = null;
   var ctlMkTxt = '', ctlMkUntil = 0, ctlMkArmI = true, ctlMkArmO = true;
   var ctlMkLit = '', ctlMkPhase = '', ctlMkPlayAfter = false, ctlMkMutedBy = false;
   var CTLMKMS = 1000, CTLMKNEAR = 0.75, CTLMKH = 0.14;
-  var CTLZMPCT = 0.08, CTLZMMIN = 0.4;
+  var CTLZMPCT = 0.08, CTLZMMIN = 0.4, CTLENDGAP = 0.12;
+  var CTLPANELMAX = 0.4;
+  var CTLKICKMS = 900;
+  var CTLPREVMS = 400, CTLPREVSEC = 2;
+  var CTLSEEKTOL = 0.75, CTLSEEKMS = 1500;
   var curPad = OVER, curIW = 0, curIH = 0;
 
   // re-setting the iframe size attributes re-layouts even with identical numbers
@@ -943,10 +1088,8 @@ local PLAYER_HTML = [==[
     if (!(v >= 0)) { v = 0; }
     return v;
   }
-  function ctlWin(){
+  function ctlZFit(){
     var dur = (ctlDurV > 0) ? ctlDurV : 0;
-    if (!(dur > 0)) { return { a: 0, b: 0, w: 0 }; }
-    if (ctlZoom !== 'in' && ctlZoom !== 'out') { return { a: 0, b: dur, w: dur }; }
     var i = (ctlIn > 0) ? ctlIn : 0;
     var o = ctlOutV();
     if (!(o > i)) { o = i; }
@@ -956,8 +1099,37 @@ local PLAYER_HTML = [==[
     var b = o + m;
     if (a < 0) { a = 0; }
     if (b > dur) { b = dur; }
-    if (!(b > a)) { return { a: 0, b: dur, w: dur }; }
-    return { a: a, b: b, w: b - a };
+    return { a: a, b: b };
+  }
+
+  function ctlZSeed(){
+    var f = ctlZFit();
+    ctlZA = f.a;
+    ctlZB = f.b;
+  }
+
+  function ctlZHold(){
+    if (!(ctlZB > ctlZA)) { return false; }
+    if (ctlDrag) { return true; }
+    var i = (ctlIn > 0) ? ctlIn : 0;
+    var o = ctlOutV();
+    if (i < ctlZA || i > ctlZB) { return false; }
+    if (o < ctlZA || o > ctlZB) { return false; }
+    return true;
+  }
+
+  function ctlZDrop(){
+    ctlZA = -1;
+    ctlZB = -1;
+  }
+
+  function ctlWin(){
+    var dur = (ctlDurV > 0) ? ctlDurV : 0;
+    if (!(dur > 0)) { return { a: 0, b: 0, w: 0 }; }
+    if (ctlZoom !== 'in' && ctlZoom !== 'out') { return { a: 0, b: dur, w: dur }; }
+    if (!ctlZHold()) { ctlZSeed(); }
+    if (!(ctlZB > ctlZA)) { return { a: 0, b: dur, w: dur }; }
+    return { a: ctlZA, b: ctlZB, w: ctlZB - ctlZA };
   }
   function ctlPct(t){
     var w = ctlWin();
@@ -978,8 +1150,19 @@ local PLAYER_HTML = [==[
   function ctlSeekTo(t){
     if (!player) { return; }
     if (t < 0) { t = 0; }
-    if (ctlDurV > 0 && t > ctlDurV - 0.05) { t = ctlDurV - 0.05; }
+    if (ctlDurV > 0 && t > ctlDurV - CTLENDGAP) { t = ctlDurV - CTLENDGAP; }
+    ctlWantT = t;
+    try { ctlWantMs = Date.now(); } catch (x) { ctlWantMs = 0; }
     try { player.seekTo(t, true); } catch (x) {}
+  }
+
+  function ctlSettled(a){
+    if (!(ctlWantT >= 0)) { return true; }
+    if (Math.abs(a - ctlWantT) <= CTLSEEKTOL) { ctlWantT = -1; return true; }
+    var now3 = 0;
+    try { now3 = Date.now(); } catch (x) { ctlWantT = -1; return true; }
+    if (!ctlWantMs || now3 - ctlWantMs > CTLSEEKMS) { ctlWantT = -1; return true; }
+    return false;
   }
   function ctlPause(){
     if (!player) { return; }
@@ -1042,8 +1225,8 @@ local PLAYER_HTML = [==[
     try { ctl.style.fontSize = fs + 'px'; } catch (x) {}
     var ph = 0;
     try { ph = panel.offsetHeight || 0; } catch (x) {}
-    var cap = Math.round(H * 0.70);
-    if (ph > cap && cap > 0) {
+    var cap = Math.round(H * CTLPANELMAX);
+    for (var pi = 0; pi < 4 && cap > 0 && ph > cap && fs > 8; pi++) {
       fs = Math.floor(fs * cap / ph);
       if (!(fs >= 8)) { fs = 8; }
       try { ctl.style.fontSize = fs + 'px'; } catch (x) {}
@@ -1209,7 +1392,7 @@ local PLAYER_HTML = [==[
 
   function ctlPaint(){
     var a = ctlAt();
-    if (!ctlDrag && a >= 0) { ctlPos = a; }
+    if (!ctlDrag && a >= 0 && ctlSettled(a)) { ctlPos = a; }
     ctlMkWatch(a);
     var o = ctlOutV();
     ctlBtnPaint();
@@ -1217,17 +1400,80 @@ local PLAYER_HTML = [==[
       ctlE('ctlnow').textContent = (a >= 0) ? ctlFmt(a) : '--.---';
       ctlE('ctlvin').textContent = ctlFmt(ctlIn);
       ctlE('ctlvout').textContent = ctlFmt(ctlOut);
-      ctlE('ctlvlen').textContent = (o > ctlIn)
-        ? ((o - ctlIn).toFixed(3) + 's')
-        : 'INVALID';
-      ctlE('ctlph').style.left = ctlPct(ctlPos) + '%';
-      ctlE('ctlhi').style.left = ctlPct(ctlIn) + '%';
-      ctlE('ctlho').style.left = ctlPct(o) + '%';
-      var bd = ctlE('ctlband');
-      bd.style.left = ctlPct(ctlIn) + '%';
-      bd.style.width = (ctlPct(o) - ctlPct(ctlIn)) + '%';
+      ctlE('ctlvlen').textContent = !(ctlDurV > 0) ? 'WAIT'
+        : ((o > ctlIn) ? ((o - ctlIn).toFixed(3) + 's') : 'INVALID');
+      ctlE('ctlsl').classList.toggle('ctlwait', !(ctlDurV > 0));
+      if (ctlDurV > 0) {
+        ctlE('ctlph').style.left = ctlPct(ctlPos) + '%';
+        ctlE('ctlhi').style.left = ctlPct(ctlIn) + '%';
+        ctlE('ctlho').style.left = ctlPct(o) + '%';
+        var bd = ctlE('ctlband');
+        bd.style.left = ctlPct(ctlIn) + '%';
+        bd.style.width = (ctlPct(o) - ctlPct(ctlIn)) + '%';
+      }
     } catch (x) {}
     ctlMkPaint();
+  }
+
+  function ctlKick(){
+    if (ctlDurV > 0 || ctlKickOn || !player) { return; }
+    if (ctlKickAt === 0) { return; }
+    var now = 0;
+    try { now = Date.now(); } catch (x) { return; }
+    if (now - ctlKickAt < CTLKICKMS) { return; }
+    ctlKickOn = true;
+    ctlMkMute(true);
+    try { player.playVideo(); } catch (x) {}
+  }
+
+  function ctlKickDone(){
+    ctlKickOn = false;
+    ctlKickAt = 0;
+    try { player.pauseVideo(); } catch (x) {}
+    ctlPlaying = false;
+    ctlMkMute(false);
+  }
+
+  function ctlDurEdge(){
+    ctlSeedOut();
+    if (ctlKickOn) { ctlKickDone(); }
+    if (!ctlSeeded) {
+      ctlSeeded = true;
+      ctlPos = (ctlIn > 0) ? ctlIn : 0;
+      ctlSeekTo(ctlPos);
+    }
+    if (!ctlDurTold) {
+      ctlDurTold = true;
+      report('ready', '&dur=' + ctlDurV);
+    }
+    ctlConfirmPaint();
+  }
+
+  function ctlInRange(){
+    var a = ctlAt();
+    var at = (a >= 0) ? a : ctlPos;
+    var o = ctlOutV();
+    if (!(o > ctlIn)) { return false; }
+    return at >= ctlIn && at < o;
+  }
+
+  function ctlToggle(){
+    if (!player || !(ctlDurV > 0)) { return; }
+    ctlPrevStop();
+    try {
+      if (ctlPlaying) { player.pauseVideo(); ctlPlaying = false; }
+      else if (ctlRange && !ctlInRange()) {
+        ctlPos = ctlIn;
+        ctlSeekTo(ctlIn);
+        player.pauseVideo();
+        ctlPlaying = false;
+        ctlMkBegin('start', true);
+      } else {
+        player.playVideo();
+        ctlPlaying = true;
+      }
+    } catch (x) {}
+    ctlPaint();
   }
 
   function ctlHome(){
@@ -1235,6 +1481,8 @@ local PLAYER_HTML = [==[
   }
 
   function ctlOnEnded(){
+    ctlPrevStop();
+    if (!ctlPlaying) { ctlPause(); return; }
     var h = ctlHome();
     ctlSeekTo(h);
     ctlPos = h;
@@ -1246,8 +1494,10 @@ local PLAYER_HTML = [==[
     ctlRaf = null;
     if (!ctlOn) { return; }
     if (player) {
+      var d0 = ctlDurV;
       try { ctlDurV = player.getDuration() || 0; } catch (x) {}
       ctlSeedOut();
+      if (!(d0 > 0) && ctlDurV > 0) { ctlDurEdge(); } else { ctlKick(); }
       var ps = -99;
       try { ps = player.getPlayerState(); } catch (x) { ps = -99; }
       if (ps !== ctlState) {
@@ -1255,7 +1505,8 @@ local PLAYER_HTML = [==[
         if (ps === 0) { ctlOnEnded(); }
       }
       ctlSyncPlay(ps);
-      if (ctlRange && ctlPlaying && ctlMkPhase === '') {
+      ctlPrevStep();
+      if (ctlRange && ctlPlaying && ctlMkPhase === '' && ctlPrevEnd < 0) {
         var a2 = ctlAt();
         var o2 = ctlOutV();
         if (a2 >= 0 && o2 > ctlIn && a2 >= o2) {
@@ -1272,8 +1523,9 @@ local PLAYER_HTML = [==[
     ctlRaf = requestAnimationFrame(ctlTick);
   }
 
-  function ctlNudge(which, d){
+  function ctlMove(which, d){
     var dur = (ctlDurV > 0) ? ctlDurV : 0;
+    if (!(dur > 0)) { return -1; }
     var cur;
     if (which === 'in') {
       cur = ctlClamp(ctlIn + d, 0, ctlOutV() - FR);
@@ -1286,8 +1538,78 @@ local PLAYER_HTML = [==[
     ctlMkClear();
     ctlPos = cur;
     ctlSeekTo(cur);
+    return cur;
+  }
+
+  function ctlNudge(which, d){
+    if (ctlMove(which, d) < 0) { return; }
+    ctlPrevArm(which);
     ctlConfirmPaint();
     ctlPaint();
+  }
+
+  function ctlTake(which){
+    if (!(ctlDurV > 0)) { return; }
+    var a = ctlAt();
+    var at = (a >= 0) ? a : ctlPos;
+    ctlPause();
+    ctlMkClear();
+    ctlSetBy(which, at, true);
+    ctlPrevArm(which);
+    ctlConfirmPaint();
+    ctlPaint();
+  }
+
+  function ctlPrevArm(which){
+    ctlPrevEnd = -1;
+    ctlPrevBack = -1;
+    ctlPrevWho = which;
+    try { ctlPrevAt = Date.now(); } catch (x) { ctlPrevAt = 0; }
+  }
+
+  function ctlPrevRun(from, end, back){
+    if (from < 0) { from = 0; }
+    if (end > ctlDurV) { end = ctlDurV; }
+    if (!(end > from)) { return false; }
+    ctlPrevEnd = end;
+    ctlPrevBack = back;
+    ctlPrevFrom = from;
+    ctlPos = from;
+    ctlSeekTo(from);
+    return true;
+  }
+
+  function ctlPrevStep(){
+    if (ctlPrevFrom >= 0) {
+      var a5 = ctlAt();
+      if (a5 >= 0 && ctlSettled(a5)) {
+        ctlPrevFrom = -1;
+        ctlPlay();
+      }
+      return;
+    }
+    if (ctlPrevEnd >= 0) {
+      var a3 = ctlAt();
+      if (a3 >= 0 && a3 >= ctlPrevEnd) {
+        var back = ctlPrevBack;
+        ctlPause();
+        ctlPrevStop();
+        if (back >= 0) { ctlPos = back; ctlSeekTo(back); }
+      }
+      return;
+    }
+    if (!ctlPrevAt || !(ctlDurV > 0)) { return; }
+    var now2 = 0;
+    try { now2 = Date.now(); } catch (x) { return; }
+    if (now2 - ctlPrevAt < CTLPREVMS) { return; }
+    ctlPrevAt = 0;
+    if (ctlPrevWho === 'out') {
+      var o = ctlOutV();
+      ctlPrevRun(o - CTLPREVSEC, o, o);
+    } else {
+      var i = (ctlIn > 0) ? ctlIn : 0;
+      ctlPrevRun(i, i + CTLPREVSEC, i);
+    }
   }
 
   function ctlGoMark(which){
@@ -1296,6 +1618,7 @@ local PLAYER_HTML = [==[
     ctlPause();
     ctlMkClear();
     ctlZoom = (ctlZoom === which) ? '' : which;
+    ctlZDrop();
     var t = (which === 'in') ? ((ctlIn > 0) ? ctlIn : 0) : ctlOutV();
     ctlPos = t;
     ctlSeekTo(t);
@@ -1327,38 +1650,98 @@ local PLAYER_HTML = [==[
     return w.a + (x / r.width) * w.w;
   }
 
-  function ctlHandle(el, set){
-    if (!el) { return; }
-    el.addEventListener('pointerdown', function(ev){
-      if (!(ctlDurV > 0)) { return; }
-      try { el.setPointerCapture(ev.pointerId); } catch (x) {}
-      el.classList.add('ctldrag');
-      ctlDrag = true;
-      ctlDragPlay = ctlPlaying;
-      ctlPause();
-      ctlMkClear();
-      set(ctlTAt(ev), false);
-      var move = function(e){
-        var t = ctlTAt(e);
-        if (t >= 0) { set(t, false); }
-      };
-      var up = function(e){
-        el.classList.remove('ctldrag');
-        el.removeEventListener('pointermove', move);
-        el.removeEventListener('pointerup', up);
-        el.removeEventListener('pointercancel', up);
-        var t = ctlTAt(e);
-        if (t >= 0) { set(t, true); }
-        ctlDrag = false;
-        ctlConfirmPaint();
-        if (ctlDragPlay) { ctlPlay(); }
-      };
-      el.addEventListener('pointermove', move);
-      el.addEventListener('pointerup', up);
-      el.addEventListener('pointercancel', up);
-      try { ev.preventDefault(); } catch (x) {}
-    });
+  function ctlMarkOf(who){
+    if (who === 'in') { return (ctlIn > 0) ? ctlIn : 0; }
+    if (who === 'out') { return ctlOutV(); }
+    return ctlPos;
   }
+
+  function ctlGoTo(t){
+    ctlPause();
+    ctlMkClear();
+    ctlPos = t;
+    ctlSeekTo(t);
+    ctlPaint();
+  }
+
+  function ctlSetMode(who){
+    if (who !== 'in' && who !== 'out' && who !== 'ph') { who = 'free'; }
+    ctlMode = who;
+    ctlModePaint();
+    if (!(ctlDurV > 0)) { return; }
+    if (who === 'in' || who === 'out') { ctlGoTo(ctlMarkOf(who)); }
+  }
+
+  function ctlPrevStop(){
+    ctlPrevAt = 0;
+    ctlPrevEnd = -1;
+    ctlPrevBack = -1;
+    ctlPrevFrom = -1;
+  }
+
+  function ctlModePaint(){
+    try {
+      ['free', 'in', 'out', 'ph'].forEach(function(k){
+        ctlE('ctlk' + k).classList.toggle('ctlkon', ctlMode === k);
+      });
+      ctlE('ctlhi').classList.toggle('ctlarm', ctlMode === 'in');
+      ctlE('ctlho').classList.toggle('ctlarm', ctlMode === 'out');
+      ctlE('ctlsl').classList.toggle('ctlaim', ctlMode !== 'free');
+    } catch (x) {}
+  }
+
+  function ctlSetBy(who, t, fin){
+    if (who === 'in') {
+      ctlIn = ctlClamp(t, 0, ctlOutV() - FR);
+      ctlFollow(ctlIn, fin);
+      return;
+    }
+    if (who === 'out') {
+      var dur = (ctlDurV > 0) ? ctlDurV : 0;
+      ctlOut = ctlClamp(t, Math.min(dur, ctlIn + FR), dur);
+      ctlFollow(ctlOut, fin);
+      return;
+    }
+    ctlPos = ctlClamp(t, 0, (ctlDurV > 0) ? ctlDurV : 0);
+    ctlFollow(ctlPos, fin);
+  }
+
+  function ctlGrab(el, who, ev, hold){
+    if (!(ctlDurV > 0)) { return; }
+    var lit = (who === 'pos') ? ctlE('ctlph') : ctlE(who === 'in' ? 'ctlhi' : 'ctlho');
+    try { el.setPointerCapture(ev.pointerId); } catch (x) {}
+    try { lit.classList.add('ctldrag'); } catch (x) {}
+    ctlDrag = true;
+    ctlPrevStop();
+    ctlDragPlay = ctlPlaying;
+    ctlPause();
+    ctlMkClear();
+    if (hold) { ctlGoTo(ctlMarkOf(who)); }
+    else { ctlSetBy(who, ctlTAt(ev), false); }
+    var move = function(e){
+      var t = ctlTAt(e);
+      if (!(t >= 0)) { return; }
+      ctlMoved = true;
+      ctlSetBy(who, t, false);
+    };
+    var up = function(e){
+      try { lit.classList.remove('ctldrag'); } catch (x) {}
+      el.removeEventListener('pointermove', move);
+      el.removeEventListener('pointerup', up);
+      el.removeEventListener('pointercancel', up);
+      var t = ctlTAt(e);
+      if (t >= 0 && !(hold && !ctlMoved)) { ctlSetBy(who, t, true); }
+      ctlDrag = false;
+      ctlMoved = false;
+      ctlConfirmPaint();
+      if (ctlDragPlay) { ctlPlay(); }
+    };
+    el.addEventListener('pointermove', move);
+    el.addEventListener('pointerup', up);
+    el.addEventListener('pointercancel', up);
+    try { ev.preventDefault(); } catch (x) {}
+  }
+
 
   function ctlBind(id, fn){
     var el = ctlE(id);
@@ -1370,13 +1753,29 @@ local PLAYER_HTML = [==[
           try { el.classList.remove('ctlpress'); } catch (x) {}
         }, 140);
         fn(ev);
+        try { ctlE('ctlpp').focus(); } catch (x) {}
       });
     } catch (x) {}
+  }
+
+  function ctlKey(ev){
+    if (!ctlOn || ctlDead) { return; }
+    var k = '';
+    try { k = ev.key || ''; } catch (x) { return; }
+    if (k === '1' || k === 'Escape') { ctlSetMode('free'); return; }
+    if (k === '2') { ctlSetMode('in'); return; }
+    if (k === '3') { ctlSetMode('out'); return; }
+    if (k === '4') { ctlSetMode('ph'); return; }
+    if (k !== ' ' && k !== 'Spacebar') { return; }
+    try { ev.preventDefault(); } catch (x) {}
+    ctlToggle();
   }
 
   function ctlWire(){
     if (ctlWired) { return; }
     ctlWired = true;
+    try { window.addEventListener('keydown', ctlKey); } catch (x) {}
+    ctlModePaint();
 
     try {
       var nb = document.querySelectorAll('#ctl button[data-n]');
@@ -1391,52 +1790,33 @@ local PLAYER_HTML = [==[
       }
     } catch (x) {}
 
-    ctlHandle(ctlE('ctlhi'), function(t, fin){
-      ctlIn = ctlClamp(t, 0, ctlOutV() - FR);
-      ctlFollow(ctlIn, fin);
-    });
-    ctlHandle(ctlE('ctlho'), function(t, fin){
-      var dur = (ctlDurV > 0) ? ctlDurV : 0;
-      ctlOut = ctlClamp(t, Math.min(dur, ctlIn + FR), dur);
-      ctlFollow(ctlOut, fin);
-    });
-
     try {
-      ctlE('ctlsl').addEventListener('pointerdown', function(ev){
+      var sl = ctlE('ctlsl');
+      sl.addEventListener('pointerdown', function(ev){
+        var who = 'pos', onh = false;
         try {
-          if (ev.target && ev.target.classList
-              && ev.target.classList.contains('ctlh')) { return; }
-        } catch (x) {}
-        var t = ctlTAt(ev);
-        if (!(t >= 0)) { return; }
-        ctlPos = t;
-        ctlSeekTo(t);
-        ctlPaint();
+          onh = !!(ev.target && ev.target.classList
+                   && ev.target.classList.contains('ctlh'));
+        } catch (x) { onh = false; }
+        if (ctlMode === 'in' || ctlMode === 'out') {
+          who = ctlMode;
+          onh = false;
+        } else if (ctlMode === 'free' && onh) {
+          who = (ev.target.id === 'ctlhi') ? 'in' : 'out';
+        }
+        ctlGrab(sl, who, ev, onh);
       });
     } catch (x) {}
+
+    ctlBind('ctltin', function(){ ctlTake('in'); });
+    ctlBind('ctltout', function(){ ctlTake('out'); });
 
     ctlBind('ctlloop', function(){
       ctlLoop = !ctlLoop;
       ctlPaint();
     });
 
-    ctlBind('ctlpp', function(){
-      if (!player) { return; }
-      try {
-        if (ctlPlaying) { player.pauseVideo(); ctlPlaying = false; }
-        else if (ctlRange) {
-          ctlPos = ctlIn;
-          ctlSeekTo(ctlIn);
-          player.pauseVideo();
-          ctlPlaying = false;
-          ctlMkBegin('start', true);
-        } else {
-          player.playVideo();
-          ctlPlaying = true;
-        }
-      } catch (x) {}
-      ctlPaint();
-    });
+    ctlBind('ctlpp', function(){ ctlToggle(); });
     ctlBind('ctlmute', function(){
       if (!player) { return; }
       try {
@@ -1494,10 +1874,13 @@ local PLAYER_HTML = [==[
     ctlSeedOut();
     ctlPaint();
     layoutCtl();
-    if (!ctlSeeded && ctlIn > 0) {
+    if (!ctlSeeded && ctlIn > 0 && ctlDurV > 0) {
       ctlSeeded = true;
       ctlPos = ctlIn;
       ctlSeekTo(ctlIn);
+    }
+    if (!(ctlDurV > 0)) {
+      try { ctlKickAt = Date.now(); } catch (x) { ctlKickAt = 0; }
     }
     report('ctl_on', '&t=' + T0.toFixed(3) + '&mark=' + ctlIn.toFixed(3));
     if (ctlRaf === null) { ctlRaf = requestAnimationFrame(ctlTick); }
@@ -1507,6 +1890,9 @@ local PLAYER_HTML = [==[
     ctlDead = true;
     var was = ctlOn;
     ctlOn = false;
+    ctlKickAt = 0;
+    ctlPrevStop();
+    if (ctlKickOn) { ctlKickOn = false; ctlMkMute(false); }
     if (ctlRaf !== null) {
       try { cancelAnimationFrame(ctlRaf); } catch (x) {}
       ctlRaf = null;
@@ -1838,6 +2224,445 @@ local PLAYER_HTML = [==[
 </script>
 <script src="https://www.youtube.com/iframe_api"></script>
 </body></html>
+]==]
+
+local SERVER_PL = [==[
+use strict;
+use warnings;
+use IO::Socket::INET;
+use IO::Select;
+use Getopt::Long qw(GetOptions);
+use Time::HiRes qw(time);
+use POSIX qw(strftime);
+use File::Spec;
+use File::Basename qw(basename);
+use Cwd qw(abs_path);
+
+my $PreferredPort = 0;
+my ($PortFile, $Events, $Stop, $Log, $Beat) = ('', '', '', '', '');
+my ($ProbeReq, $Go, $Ctl, $Owner, $OwnerId) = ('', '', '', '', '');
+my $Root = '.';
+my $OwnerGoneSec = 20;
+my $MaxHours = 12;
+my $ProbeOnly = 0;
+my $Vid = '';
+
+GetOptions(
+  'PreferredPort=i' => \$PreferredPort,
+  'PortFile=s'      => \$PortFile,
+  'Root=s'          => \$Root,
+  'Events=s'        => \$Events,
+  'Stop=s'          => \$Stop,
+  'Log=s'           => \$Log,
+  'Beat=s'          => \$Beat,
+  'ProbeReq=s'      => \$ProbeReq,
+  'Go=s'            => \$Go,
+  'Ctl=s'           => \$Ctl,
+  'Owner=s'         => \$Owner,
+  'OwnerId=s'       => \$OwnerId,
+  'OwnerGoneSec=i'  => \$OwnerGoneSec,
+  'MaxHours=i'      => \$MaxHours,
+  'ProbeOnly'       => \$ProbeOnly,
+  'Vid=s'           => \$Vid,
+) or die "bad arguments\n";
+
+$Root = abs_path($Root) || $Root;
+sub under { return File::Spec->catfile($Root, $_[0]); }
+$Events   = under('yt_events.txt')  unless $Events;
+$Stop     = under('yt_stop.flag')   unless $Stop;
+$Log      = under('yt_server.log')  unless $Log;
+$PortFile = under('yt_port.txt')    unless $PortFile;
+$Beat     = under('yt_beat.txt')    unless $Beat;
+$ProbeReq = under('yt_probe_req.txt') unless $ProbeReq;
+$Go       = under('yt_go.flag')     unless $Go;
+$Ctl      = under('yt_ctl.flag')    unless $Ctl;
+$Owner    = under('yt_owner.txt')   unless $Owner;
+
+my $SelfPath = abs_path($0) || $0;
+
+sub say_log {
+  my ($m) = @_;
+  my $line = strftime('%H:%M:%S', localtime) . " $m";
+  if (open(my $fh, '>>', $Log)) { print $fh "$line\n"; close $fh; }
+}
+
+sub slurp {
+  my ($path) = @_;
+  open(my $fh, '<', $path) or return undef;
+  local $/;
+  my $data = <$fh>;
+  close $fh;
+  return defined($data) ? $data : '';
+}
+
+sub spit {
+  my ($path, $data) = @_;
+  open(my $fh, '>', $path) or return 0;
+  print $fh $data;
+  close $fh;
+  return 1;
+}
+
+sub trim { my $s = defined($_[0]) ? $_[0] : ''; $s =~ s/^\s+//; $s =~ s/\s+$//; return $s; }
+
+my $lastBeat = 0;
+sub beat {
+  my ($force) = @_;
+  my $now = time();
+  return if !$force && ($now - $lastBeat) < 2;
+  $lastBeat = $now;
+  spit($Beat, sprintf('%.0f', $now * 10000000));
+}
+
+sub eventsHighWater {
+  my $txt = slurp($Events);
+  return 0 unless defined $txt;
+  my $hi = 0;
+  while ($txt =~ /seq=(\d+)/g) { $hi = $1 if $1 > $hi; }
+  return $hi;
+}
+
+my $seq = 0;
+sub nextSeq {
+  my $hi = eventsHighWater();
+  if ($hi > $seq) {
+    $seq = $hi;
+    say_log("seq bumped to $hi - another writer is ahead");
+  }
+  $seq++;
+  return $seq;
+}
+
+sub appendEvent {
+  my ($payload) = @_;
+  for my $try (1 .. 4) {
+    my $n = nextSeq();
+    my $t = strftime('%H:%M:%S', localtime) . sprintf('.%03d', (time() - int(time())) * 1000);
+    if (open(my $fh, '>>', $Events)) {
+      print $fh "seq=$n t=$t $payload\n";
+      close $fh;
+      return 1;
+    }
+    select(undef, undef, undef, 0.04);
+  }
+  say_log("append failed after 4 tries: $payload");
+  return 0;
+}
+
+sub goodVid { return defined($_[0]) && $_[0] =~ /^[A-Za-z0-9_\-]{6,24}$/; }
+
+sub spawnProbe {
+  my ($vid) = @_;
+  unless (goodVid($vid)) {
+    say_log('probe skipped (no usable video id)');
+    return;
+  }
+  my $pid = fork();
+  if (!defined $pid) {
+    say_log("probe worker could not be spawned for $vid");
+    appendEvent("type=probe&err=1&pv=$vid");
+    return;
+  }
+  if ($pid == 0) {
+    exec($^X, $SelfPath, '-ProbeOnly', '-Vid', $vid, '-Root', $Root,
+         '-Events', $Events, '-Log', $Log);
+    exit 127;
+  }
+  say_log("probe worker spawned for $vid");
+}
+
+sub checkProbeRequest {
+  return unless $ProbeReq;
+  return unless -e $ProbeReq;
+  my $vid = trim(slurp($ProbeReq));
+  unlink($ProbeReq);
+  if (goodVid($vid)) {
+    say_log("probe requested by file: $vid");
+    spawnProbe($vid);
+  } else {
+    say_log('probe request file ignored (no usable video id)');
+  }
+}
+
+sub goAnswer {
+  my ($want) = @_;
+  return 'go=0' unless $Go;
+  my $w = trim($want);
+  return 'go=0' if $w eq '' || $w eq '0';
+  return 'go=0' unless -e $Go;
+  my $have = trim(slurp($Go));
+  return 'go=0' if $have eq '' || $have eq '0';
+  return 'go=1' if $have eq $w;
+  return 'go=0';
+}
+
+sub ctlAnswer {
+  my ($want) = @_;
+  return '' unless $Ctl;
+  my $w = trim($want);
+  return '' if $w eq '' || $w eq '0';
+  return '' unless -e $Ctl;
+  my $have = trim(slurp($Ctl));
+  return '' if $have eq '' || $have eq '0';
+  return '' if $have ne $w;
+  unlink($Ctl) or return '';
+  say_log('control layer armed once and the flag spent');
+  return '&ctl=1';
+}
+
+my $ownerVal = '';
+my $ownerAt = time();
+my $ownerGone = 0;
+sub ownerLost {
+  return '' unless $OwnerId;
+  my $now = time();
+  my $txt = '';
+  if (-e $Owner) {
+    my $raw = slurp($Owner);
+    return '' unless defined $raw;
+    $txt = trim($raw);
+  }
+  if ($txt ne '') {
+    my $id = $txt;
+    $id =~ s/[\r\n].*$//s;
+    $id = trim($id);
+    if ($id ne $OwnerId) {
+      return 'another OBS now owns the work folder, so this older server is standing down instead of appending to a shared event file beside it';
+    }
+  }
+  if ($txt ne $ownerVal) {
+    $ownerVal = $txt;
+    $ownerAt = $now;
+    return '';
+  }
+  if (($now - $ownerAt) >= $OwnerGoneSec) {
+    return "the OBS that started this server stopped writing its owner file $OwnerGoneSec seconds ago, so that OBS is gone and this server is ending itself";
+  }
+  return '';
+}
+
+sub fetch_url {
+  my ($url) = @_;
+  my $pid = open(my $fh, '-|', 'curl', '-sS', '--max-time', '4', '--', $url);
+  return '' unless $pid;
+  local $/;
+  my $body = <$fh>;
+  close $fh;
+  return defined($body) ? $body : '';
+}
+
+if ($ProbeOnly) {
+  $seq = 0;
+  my $tag = goodVid($Vid) ? "&pv=$Vid" : '';
+  my ($pw, $ph) = (0, 0);
+  if (goodVid($Vid)) {
+    my $body = fetch_url("https://www.youtube.com/watch?v=$Vid");
+    while ($body =~ /"width":(\d+),"height":(\d+)/g) {
+      my ($w2, $h2) = ($1, $2);
+      if (($w2 * $h2) > ($pw * $ph)) { ($pw, $ph) = ($w2, $h2); }
+    }
+  }
+  my $ah = '';
+  if (goodVid($Vid)) {
+    my $inner = "https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D$Vid";
+    my $body = fetch_url("https://www.youtube.com/oembed?url=$inner&format=json");
+    if ($body =~ m{"author_url"\s*:\s*"[^"]*?youtube\.com\\?/\@([A-Za-z0-9_.\-]{1,40})}) {
+      $ah = '@' . $1;
+    }
+  }
+  my $ahq = ($ah ne '') ? "&ah=$ah" : '';
+  if ($ah ne '') { say_log("probe worker: channel handle $ah"); }
+  else { say_log('probe worker: no channel handle (best-effort, the name is used)'); }
+  if ($pw > 0 && $ph > 0) {
+    appendEvent("type=probe&w=$pw&h=$ph$tag$ahq");
+    say_log("probe worker: native size $pw x $ph");
+  } else {
+    appendEvent("type=probe&err=1$tag$ahq");
+    say_log('probe worker: native size not found (best-effort, ignored)');
+  }
+  exit 0;
+}
+
+unlink($Stop)     if -e $Stop;
+unlink($PortFile) if -e $PortFile;
+unlink($Beat)     if -e $Beat;
+
+my @cands;
+push @cands, $PreferredPort if $PreferredPort > 0;
+push @cands, 20000 + int(rand(28000)) for (1 .. 30);
+
+my @socks;
+my $Port = 0;
+for my $c (@cands) {
+  my $s4 = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => $c,
+                                 Listen => 16, Proto => 'tcp', ReuseAddr => 1);
+  next unless $s4;
+  @socks = ($s4);
+  $Port = $c;
+  my $s6 = eval {
+    require IO::Socket::IP;
+    IO::Socket::IP->new(LocalHost => '::1', LocalPort => $c, Listen => 16,
+                        Proto => 'tcp', ReuseAddr => 1, V6Only => 1);
+  };
+  push @socks, $s6 if $s6;
+  last;
+}
+
+if (!@socks) { say_log('BIND FAILED (no free port)'); exit 1; }
+say_log('listening on both 127.0.0.1 and ::1') if @socks > 1;
+
+my $portWritten = 0;
+for my $pt (1 .. 4) {
+  if (spit($PortFile, "$Port")) { $portWritten = 1; last; }
+  say_log("port file write failed (try $pt of 4): $!");
+  select(undef, undef, undef, 0.1);
+}
+if (!$portWritten) {
+  say_log("PORT FILE NOT WRITTEN after 4 tries: $PortFile");
+  say_log("Lua cannot learn port $Port, so no page URL can be built. This listener stays up; Lua's heartbeat watchdog is the only remaining exit.");
+}
+beat(1);
+say_log("listening on http://localhost:$Port/  root=$Root");
+
+my %types = (
+  '.html' => 'text/html; charset=utf-8',
+  '.js'   => 'application/javascript; charset=utf-8',
+  '.css'  => 'text/css; charset=utf-8',
+  '.json' => 'application/json; charset=utf-8',
+);
+
+$seq = eventsHighWater();
+say_log("event sequence seeded at $seq");
+
+my $deadline = time() + ($MaxHours * 3600);
+my $sel = IO::Select->new(@socks);
+$SIG{CHLD} = 'IGNORE';
+$SIG{PIPE} = 'IGNORE';
+
+sub unescape {
+  my ($s) = @_;
+  $s =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/ge;
+  return $s;
+}
+
+sub qparam {
+  my ($query, $name) = @_;
+  for my $kv (split(/&/, $query)) {
+    my $eq = index($kv, '=');
+    next unless $eq > 0;
+    next unless substr($kv, 0, $eq) eq $name;
+    return unescape(substr($kv, $eq + 1));
+  }
+  return '';
+}
+
+sub respond {
+  my ($cl, $code, $ctype, $body) = @_;
+  my %msg = (200 => 'OK', 204 => 'No Content', 404 => 'Not Found');
+  my $head = "HTTP/1.1 $code " . ($msg{$code} || 'OK') . "\r\n"
+           . "Cache-Control: no-store\r\n"
+           . "Connection: close\r\n";
+  if ($code == 204) {
+    $head .= "\r\n";
+    $body = '';
+  } else {
+    $head .= "Content-Type: $ctype\r\n"
+           . 'Content-Length: ' . length($body) . "\r\n\r\n";
+  }
+  print $cl $head . $body;
+}
+
+my $quit = 0;
+while (!$quit) {
+  beat(0);
+  my @ready = $sel->can_read(0.4);
+  if (!@ready) {
+    beat(0);
+    checkProbeRequest();
+    last if -e $Stop;
+    my $lost = ownerLost();
+    if ($lost ne '') { say_log("exiting: $lost"); $ownerGone = 1; last; }
+    if (time() > $deadline) { say_log('max lifetime reached'); last; }
+    next;
+  }
+  for my $lsn (@ready) {
+    my $cl = $lsn->accept() or next;
+    $cl->autoflush(1);
+    my $line = <$cl>;
+    if (!defined $line) { close $cl; next; }
+    while (my $h = <$cl>) { last if $h =~ /^\r?\n$/; }
+    my ($target) = $line =~ m{^\S+\s+(\S+)};
+    $target = '/' unless defined $target;
+    my ($path, $query) = split(/\?/, $target, 2);
+    $path = unescape(defined($path) ? $path : '/');
+    $query = '' unless defined $query;
+
+    if ($path eq '/__event') {
+      appendEvent($query);
+      respond($cl, 204);
+    }
+    elsif ($path eq '/__go') {
+      my $want = qparam($query, 'nonce');
+      my $ans = goAnswer($want) . ctlAnswer($want);
+      respond($cl, 200, 'text/plain; charset=utf-8', $ans);
+    }
+    elsif ($path eq '/__probe') {
+      respond($cl, 204);
+      close $cl;
+      spawnProbe(qparam($query, 'v'));
+      next;
+    }
+    elsif ($path eq '/__quit') {
+      say_log('quit requested');
+      respond($cl, 200, 'text/plain; charset=utf-8', '');
+      close $cl;
+      $quit = 1;
+      last;
+    }
+    else {
+      my $rel = $path;
+      $rel =~ s{^/+}{};
+      $rel = 'yt_player.html' if $rel eq '';
+      my $full = File::Spec->catfile($Root, $rel);
+      my $okf = 0;
+      if (-f $full) {
+        my $resolved = abs_path($full) || '';
+        $okf = 1 if index($resolved, $Root) == 0;
+      }
+      if ($okf) {
+        my $bytes = '';
+        if (open(my $fh, '<', $full)) { binmode $fh; local $/; $bytes = <$fh>; close $fh; }
+        $bytes = '' unless defined $bytes;
+        my $ext = ($full =~ /(\.[A-Za-z0-9]+)$/) ? lc($1) : '';
+        respond($cl, 200, $types{$ext} || 'application/octet-stream', $bytes);
+      } else {
+        respond($cl, 404, 'text/plain; charset=utf-8', 'not found');
+      }
+    }
+    close $cl;
+  }
+}
+
+close($_) for @socks;
+
+if (-e $Stop) {
+  say_log("removing work folder in a few seconds: $Root");
+  my $pid = fork();
+  if (defined $pid && $pid == 0) {
+    sleep 2;
+    if (-e $Stop && basename($Root) eq 'obs-yt-embed-recorder') {
+      system('rm', '-rf', '--', $Root);
+    }
+    exit 0;
+  }
+} elsif ($ownerGone) {
+  say_log('work folder kept: this server ended itself, so it deletes nothing that the next OBS will want');
+  unlink($Beat) if -e $Beat;
+} else {
+  say_log('work folder kept: a newer server owns it');
+  unlink($Beat) if -e $Beat;
+}
+say_log('stopped');
 ]==]
 
 local SERVER_PS1 = [==[
@@ -2288,9 +3113,11 @@ local function write_assets()
             return false
         end
     end
-    if read_file(p.ps1) ~= SERVER_PS1 then
-        if not write_file(p.ps1, SERVER_PS1) then
-            log("Cannot write the server script: %s", p.ps1)
+    local sp = PLAT.win and p.ps1 or p.pl
+    local sv = PLAT.win and SERVER_PS1 or SERVER_PL
+    if read_file(sp) ~= sv then
+        if not write_file(sp, sv) then
+            log("Cannot write the server script: %s", sp)
             return false
         end
     end
@@ -2334,22 +3161,32 @@ local function start_server()
     st.owner_n = 0
     write_file(p.owner, st.launch_id .. "\r\n0\r\n")
 
-    local ps_cmd = string.format(
-        'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""%s"" ' ..
-        '-PreferredPort %d -PortFile ""%s"" -Root ""%s"" -Events ""%s"" ' ..
-        '-Stop ""%s"" -Log ""%s"" -Beat ""%s"" -ProbeReq ""%s"" -Go ""%s"" ' ..
-        '-Ctl ""%s"" -Owner ""%s"" -OwnerId %s',
-        p.ps1, st.last_port or 0, p.port, p.dir, p.events, p.stop, p.slog,
-        p.beat, p.probe_req, p.go, p.ctl, p.owner, st.launch_id)
-    local vbs = string.format(
-        'Set sh = CreateObject("WScript.Shell")\r\nsh.Run "%s", 0, False\r\n', ps_cmd)
-    if not write_file(p.vbs, vbs) then
-        log("Cannot write the launcher: %s", p.vbs)
-        return false
+    local launch
+    if PLAT.win then
+        local ps_cmd = string.format(
+            'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""%s"" ' ..
+            '-PreferredPort %d -PortFile ""%s"" -Root ""%s"" -Events ""%s"" ' ..
+            '-Stop ""%s"" -Log ""%s"" -Beat ""%s"" -ProbeReq ""%s"" -Go ""%s"" ' ..
+            '-Ctl ""%s"" -Owner ""%s"" -OwnerId %s',
+            p.ps1, st.last_port or 0, p.port, p.dir, p.events, p.stop, p.slog,
+            p.beat, p.probe_req, p.go, p.ctl, p.owner, st.launch_id)
+        local vbs = string.format(
+            'Set sh = CreateObject("WScript.Shell")\r\nsh.Run "%s", 0, False\r\n', ps_cmd)
+        if not write_file(p.vbs, vbs) then
+            log("Cannot write the launcher: %s", p.vbs)
+            return false
+        end
+        launch = string.format('wscript.exe //B //Nologo "%s"', p.vbs)
+    else
+        launch = string.format(
+            'nohup perl "%s" -PreferredPort %d -PortFile "%s" -Root "%s" ' ..
+            '-Events "%s" -Stop "%s" -Log "%s" -Beat "%s" -ProbeReq "%s" ' ..
+            '-Go "%s" -Ctl "%s" -Owner "%s" -OwnerId %s >/dev/null 2>&1 &',
+            p.pl, st.last_port or 0, p.port, p.dir, p.events, p.stop, p.slog,
+            p.beat, p.probe_req, p.go, p.ctl, p.owner, st.launch_id)
     end
 
     -- per Lua 5.1 ref: io.popen does not wait
-    local launch = string.format('wscript.exe //B //Nologo "%s"', p.vbs)
     close_launch_pipe()
     local okp, pipe = pcall(io.popen, launch, "r")
     if okp and pipe then
@@ -2412,7 +3249,11 @@ local function check_server_health()
         end
     else
         log("Could not confirm the local server started. The log is empty: %s", p.slog)
-        log("PowerShell execution may be blocked.")
+        if PLAT.win then
+            log("PowerShell execution may be blocked.")
+        else
+            log("Check that perl is on the PATH: this script launches the local server with it, and macOS ships one at /usr/bin/perl.")
+        end
     end
 end
 
@@ -2484,7 +3325,13 @@ local function rec_fps()
 end
 
 local function url_time_now()
-    return st.url_time_sec
+    local raw = trim(cfg.yt_url or "")
+    if extract_youtube_id(raw) then return parse_time_param(raw) end
+    local uid = trim(st.url_time_id or "")
+    if uid ~= "" and uid == trim(st.video_id or "") then
+        return st.url_time_sec
+    end
+    return nil
 end
 
 local function panel_url_check()
@@ -2852,6 +3699,24 @@ local function forget_video_state(new_id)
     return true
 end
 
+local function panel_intent_check()
+    local raw = trim(cfg.yt_url or "")
+    local vid = extract_youtube_id(raw)
+    if not vid then return end
+    local t = parse_time_param(raw)
+    local same = (trim(st.url_time_id or "") == vid) and (t == st.url_time_sec)
+    if not same then st.runup_logged = nil end
+    st.url_time_id = vid
+    st.url_time_sec = t
+    if script_settings then
+        obs.obs_data_set_string(script_settings, "url_time_id", vid)
+        obs.obs_data_set_double(script_settings, "url_time_sec", t or -1)
+    end
+    if same then return end
+    if not clear_trim_range() then return end
+    log("The URL in the script panel does not carry the v and t the stored in and out points were chosen against, so those points were cleared. A stored range only survives a URL that names the same video AND the same t: either of those changing is an explicit instruction to start somewhere else, and it arrived after the range, so it wins. The take now starts at this t - or at 0 when there is none - and runs to the end of the video. Re-applying the SAME URL changes nothing and keeps the range. Open the trim controls to choose an out-point again.")
+end
+
 local function create_or_update_source(may_create)
     if not st.port then
         return bail("noport",
@@ -2953,19 +3818,25 @@ local function ctl_show_drop()
     obs.obs_source_release(src)
 end
 
+local function notify(fmt, ...)
+    local msg = (select("#", ...) > 0) and string.format(fmt, ...) or fmt
+    log("%s", msg)
+    return true
+end
+
 local function arm_control_layer(video_id)
     if not st.port then
-        log("No local server port yet, so the trim controls cannot be armed. Try again in a moment.")
+        notify("The trim controls cannot open yet: the local server has not reported its port. Try again in a moment.")
         return nil
     end
     video_id = trim(video_id or "")
     if video_id == "" then video_id = resolve_video_id() or "" end
     if video_id == "" then
-        log("No YouTube video is configured yet, so the trim controls have nothing to show. Paste a YouTube URL into the 'YouTube URL' box in this script's settings first.")
+        notify("The trim controls have nothing to show: no YouTube video is configured yet. Paste a YouTube URL into this script's settings first.")
         return nil
     end
     if our_take_now() then
-        log("One of this script's own takes is running, so the trim controls were not armed: arming them rewrites the page URL, which reloads the source and would interrupt the take. Wait for the take to finish. A recording or a stream of YOUR OWN does not block this - the controls refuse to draw while this source is on Program, so arming them while your own output runs is the safe case and is how you line up the next quote without touching your show.")
+        notify("The trim controls cannot open: one of this script's own takes is running. arming them rewrites the page URL, which reloads the source and would interrupt the take. Wait for the take to finish. A recording or a stream of YOUR OWN does not block this - the controls refuse to draw while this source is on Program, so arming them while your own output runs is the safe case and is how you line up the next quote without touching your show.")
         return nil
     end
 
@@ -2974,7 +3845,7 @@ local function arm_control_layer(video_id)
         local live = obs.obs_source_active(probe)
         obs.obs_source_release(probe)
         if live then
-            log("The source '%s' is on Program, so the trim controls were not armed. They refuse to draw while the source is on program output - that refusal is what keeps them out of every recording - so arming now would reload a live source for a layer that would not appear. Switch Program to another scene and press the button again.",
+            notify("The trim controls cannot open while '%s' is on PROGRAM. They refuse to draw on a source that is live - that refusal is what keeps them out of every recording. Switch Program to another scene and ask again.",
                 REC_SOURCE_NAME)
             return nil
         end
@@ -3057,10 +3928,14 @@ local function auto_convert_source_url()
     end
     local t = parse_time_param(url)
     local t_changed = (t ~= st.url_time_sec)
-    if t_changed then st.runup_logged = nil end
+    if t_changed or trim(st.url_time_id or "") ~= vid then
+        st.runup_logged = nil
+    end
     st.url_time_sec = t
+    st.url_time_id = vid
     if script_settings then
         obs.obs_data_set_double(script_settings, "url_time_sec", t or -1)
+        obs.obs_data_set_string(script_settings, "url_time_id", vid)
     end
     if typed_here and clear_trim_range() then
         log("A URL was typed straight into the browser source, so the in and out points were cleared. Pasting an address by hand is starting over, and that is true even when it is the same video - the points were chosen against a previous pass and nothing here can tell which frames you still meant. Open the trim controls and choose them again. A URL applied from this script's own panel keeps them, unless its t= changed.")
@@ -3532,19 +4407,41 @@ local function hv_resolve_enc(raw, alias)
     return nil
 end
 
-local function hv_profile_dir(c)
+local function obs_config_roots()
+    if st.cfg_roots then return st.cfg_roots end
+    local out = {}
+    if obs.os_get_config_path_ptr then
+        local ok, r = pcall(obs.os_get_config_path_ptr, "obs-studio")
+        if ok and type(r) == "string" and trim(r) ~= "" then out[#out + 1] = trim(r) end
+    end
     local app = os.getenv("APPDATA")
-    if not app or trim(app) == "" then return nil end
-    local base = app .. "\\obs-studio\\basic\\profiles\\"
+    if PLAT.win and app and trim(app) ~= "" then
+        out[#out + 1] = join(trim(app), "obs-studio")
+    end
+    local home = os.getenv("HOME")
+    if not PLAT.win and home and trim(home) ~= "" then
+        home = trim(home)
+        out[#out + 1] = join(join(join(home, "Library"), "Application Support"),
+                             "obs-studio")
+        out[#out + 1] = join(join(home, ".config"), "obs-studio")
+    end
+    st.cfg_roots = out
+    return out
+end
+
+local function hv_profile_dir(c)
     local names = {}
     if obs.obs_frontend_get_user_config then
         local ok, uc = pcall(obs.obs_frontend_get_user_config)
         if ok and uc then names[#names + 1] = cfg_str(uc, "Basic", "ProfileDir") end
     end
     names[#names + 1] = cfg_str(c, "General", "Name")
-    for _, n in ipairs(names) do
-        if n ~= "" and read_file(base .. n .. "\\basic.ini") then
-            return base .. n
+    for _, root in ipairs(obs_config_roots()) do
+        local base = join(join(root, "basic"), "profiles")
+        for _, n in ipairs(names) do
+            if n ~= "" and read_file(join(join(base, n), "basic.ini")) then
+                return join(base, n)
+            end
         end
     end
     return nil
@@ -3553,7 +4450,7 @@ end
 local function hv_json_settings(dir, file)
     if not dir then return nil end
     if obs.obs_data_create_from_json_file == nil then return nil end
-    local ok, d = pcall(obs.obs_data_create_from_json_file, dir .. "\\" .. file)
+    local ok, d = pcall(obs.obs_data_create_from_json_file, join(dir, file))
     if not ok or not d then return nil end
     return d
 end
@@ -4449,6 +5346,7 @@ local function request_return()
     log("Program is owed a return to the scene it was on before the take, and that switch is NOT made from this script's 100ms tick. The tick runs on OBS's render thread and the Lua binding holds this script's lock for the whole of it. obs_frontend_set_current_scene hands the switch to OBS's Qt UI thread over a connection that waits for the answer, and in NORMAL - non-Studio - mode the UI thread announces the change to every script before it answers; the Lua binding cannot deliver that announcement without the lock the tick is still holding. Each side waits for the other and OBS stops drawing, which is the freeze a first-run machine saw. Studio Mode takes a different path inside OBS that announces nothing while the render thread waits, which is the only reason this has never been seen on a machine that runs Studio Mode. The switch is therefore made on the same thread OBS gives its own menus: at the next OBS frontend event, which any scene change or output start or stop produces, or when a setting in this script's panel changes, or the moment the trim button is pressed - which is what the return exists to free. Program can therefore sit on this script's scene for a moment after a take instead of leaving at once. If nothing is happening in OBS at all, switch scenes once or press the trim button and it goes immediately. This line is said once per session.")
 end
 
+
 local function service_return()
     if not st.ret_want or st.ret_busy then return false end
     if st.we_record or st.hv_output or st.hv_view or st.hv_running then
@@ -4546,6 +5444,42 @@ local function stale_page_refused(what)
     st.stale_said = key
     log("A '%s' report from the recording page WAS REFUSED AND NO TAKE WAS STARTED. This script has not seen one genuine activation of '%s' since it loaded, so the page that sent that report belongs to an earlier run: it was in the browser source before this script existed, and the nonce it quotes came back out of this script's own settings, which is why its events look like this script's own. A recording window reported by a page nobody put there is the one thing that must never start a take. Nothing was written. Take the source off program for a moment and put it back.",
         tostring(what), REC_SOURCE_NAME)
+end
+
+local function open_trim_window()
+    local vid = resolve_video_id() or ""
+    local src = arm_control_layer(vid)
+    if not src then service_return() return true end
+    if obs.obs_frontend_open_source_interaction then
+        local ok = pcall(obs.obs_frontend_open_source_interaction, src)
+        if ok then
+            log("Opened OBS's Interact window on '%s'. The trim controls are drawn on top of the recording page there, over the picture itself - they are a layer, not a second page. The IN and OUT handles already sit on the range this script is holding. Choose the points and press CONFIRM TO OBS: that stores the range and leaves the controls up, so you can listen, adjust, and confirm again. They go away on a reload, and immediately if this source goes to Program. If they look too small to read, make the Interact window larger - it scales the whole page.",
+                REC_SOURCE_NAME)
+        else
+            log("obs_frontend_open_source_interaction() failed. Right-click '%s' in OBS and choose Interact instead.",
+                REC_SOURCE_NAME)
+        end
+    else
+        log("This OBS build has no obs_frontend_open_source_interaction, so the window cannot be opened from here. Right-click '%s' in OBS and choose Interact.",
+            REC_SOURCE_NAME)
+    end
+    obs.obs_source_release(src)
+    service_return()
+    return true
+end
+
+local function service_trim()
+    if not st.trim_want or st.trim_busy then return false end
+    if not st.port then
+        request_launch("the trim controls were asked for before the server was up")
+        return false
+    end
+    st.trim_want = nil
+    st.trim_busy = true
+    local ok, err = pcall(open_trim_window)
+    st.trim_busy = false
+    if not ok then error(err, 0) end
+    return true
 end
 
 local function poll_events()
@@ -4770,9 +5704,9 @@ local function poll_events()
                     end
                     st.ended_nonce = st.nonce
                     if why == "outpoint" then
-                        schedule_stop(STOP_REASON_OUT, OUT_TAIL_MS)
+                        schedule_stop(STOP_REASON.out, OUT_TAIL_MS)
                     else
-                        schedule_stop(STOP_REASON_ENDED)
+                        schedule_stop(STOP_REASON.ended)
                     end
                 elseif etype == "error" then
                     if code == "153" then
@@ -4842,7 +5776,7 @@ local function adopt_existing_events()
     end
 end
 
-local function tick()
+local function tick_body()
     st.tick_count = st.tick_count + 1
 
     if st.relaunch_ms then
@@ -4948,6 +5882,8 @@ local function tick()
 
     rec_card_update()
 
+    service_trim()
+
     if st.ret_armed and not st.we_record and not st.hv_output
        and not st.hv_view and not st.hv_running then
         request_return()
@@ -4997,7 +5933,7 @@ local function tick()
     local active = (src ~= nil) and obs.obs_source_active(src) or false
     if src then obs.obs_source_release(src) end
 
-    if st.pending_stop and st.pending_reason == STOP_REASON_SCENE
+    if st.pending_stop and st.pending_reason == STOP_REASON.scene
        and active and source_in_current_scene(name) then
         st.pending_stop = nil
         st.pending_reason = nil
@@ -5031,7 +5967,7 @@ local function tick()
                 log("The page URL still carried the range from before the last CONFIRM, so it was rewritten here, at the activation edge, before the take. That is one extra page load for this take only - the confirm itself no longer reloads the page, which is what lets the trim controls stay up while you listen and adjust.")
             end
         end
-        if st.pending_stop and st.pending_reason == STOP_REASON_ENDED
+        if st.pending_stop and st.pending_reason == STOP_REASON.ended
            and not recording_now() then
             st.pending_stop = nil
             st.pending_reason = nil
@@ -5126,7 +6062,11 @@ local function tick()
     end
 end
 
-local function on_frontend_event(event)
+local function tick()
+    return guard("the 100ms tick", tick_body, nil, true)
+end
+
+local function on_frontend_event_body(event)
     if event == obs.OBS_FRONTEND_EVENT_FINISHED_LOADING then
         st.coll_ready = true
     end
@@ -5135,6 +6075,7 @@ local function on_frontend_event(event)
         service_launch()
         service_create()
         service_return()
+        service_trim()
     end
     if event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED then
         local ours = st.fe_ours or st.fe_stop_asked
@@ -5154,7 +6095,7 @@ local function on_frontend_event(event)
             note_program_scene(nm)
         end
         if st.we_record and recording_now() then
-            schedule_stop(STOP_REASON_SCENE, 0)
+            schedule_stop(STOP_REASON.scene, 0)
         end
     elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
         ctl_show_drop()
@@ -5169,6 +6110,10 @@ local function on_frontend_event(event)
             st.timer_on = false
         end
     end
+end
+
+local function on_frontend_event(event)
+    return guard("a frontend event", on_frontend_event_body, event)
 end
 
 function script_description()
@@ -5189,7 +6134,7 @@ function script_defaults(settings)
 
     obs.obs_data_set_default_string(settings, "rec_sound", "source")
 
-    obs.obs_data_set_default_bool(settings, "cr_on", true)
+    obs.obs_data_set_default_bool(settings, "cr_on", false)
     obs.obs_data_set_default_string(settings, "cr_mode", "yh")
     obs.obs_data_set_default_string(settings, "cr_text", "")
     obs.obs_data_set_default_string(settings, "cr_pos", "bl")
@@ -5254,7 +6199,15 @@ local function refresh_visibility(props, settings)
     vis("res_mode", not fit)
     vis("custom_height", (not fit)
         and obs.obs_data_get_string(settings, "res_mode") == "custom")
-    vis("cr_text", obs.obs_data_get_string(settings, "cr_mode") == "x")
+    local cr = obs.obs_data_get_bool(settings, "cr_on")
+    vis("cr_mode", cr)
+    vis("cr_text", cr
+        and obs.obs_data_get_string(settings, "cr_mode") == "x")
+    vis("cr_font", cr)
+    vis("cr_color", cr)
+    vis("cr_bg", cr)
+    vis("cr_pos", cr)
+    vis("cr_voff", cr)
     return true
 end
 
@@ -5263,7 +6216,7 @@ local function on_prop_modified(props, prop, settings)
     return refresh_visibility(props, settings)
 end
 
-function script_properties()
+local function script_properties_body()
     local props = obs.obs_properties_create()
 
     obs.obs_properties_add_bool(props, "enabled",
@@ -5279,25 +6232,10 @@ function script_properties()
 
     obs.obs_properties_add_button(grp, "btn_open_control",
         "Open the trim controls", function(p2, prop)
-            service_launch()
-            local vid = resolve_video_id() or ""
-            local src = arm_control_layer(vid)
-            if not src then service_return() return true end
-            if obs.obs_frontend_open_source_interaction then
-                local ok = pcall(obs.obs_frontend_open_source_interaction, src)
-                if ok then
-                    log("Opened OBS's Interact window on '%s'. The trim controls are drawn on top of the recording page there, over the picture itself - they are a layer, not a second page. The IN and OUT handles already sit on the range this script is holding. Choose the points and press CONFIRM TO OBS: that stores the range and leaves the controls up, so you can listen, adjust, and confirm again. They go away on a reload, and immediately if this source goes to Program. If they look too small to read, make the Interact window larger - it scales the whole page.",
-                        REC_SOURCE_NAME)
-                else
-                    log("obs_frontend_open_source_interaction() failed. Right-click '%s' in OBS and choose Interact instead.",
-                        REC_SOURCE_NAME)
-                end
-            else
-                log("This OBS build has no obs_frontend_open_source_interaction, so the window cannot be opened from here. Right-click '%s' in OBS and choose Interact.",
-                    REC_SOURCE_NAME)
-            end
-            obs.obs_source_release(src)
-            service_return()
+            guard("the trim button", function()
+                st.trim_want = true
+                service_trim()
+            end)
             return true
         end)
 
@@ -5359,7 +6297,9 @@ function script_properties()
 
     local gcred = obs.obs_properties_create()
 
-    obs.obs_properties_add_bool(gcred, "cr_on", "Show source credit")
+    local cron = obs.obs_properties_add_bool(gcred, "cr_on",
+        "Show source credit")
+    obs.obs_property_set_modified_callback(cron, on_prop_modified)
 
     cap(gcred, "cr_mode", "Text")
     local crm = obs.obs_properties_add_list(gcred, "cr_mode", "",
@@ -5436,7 +6376,7 @@ local function parse_custom_height(s)
     return h, false
 end
 
-function script_update(settings)
+local function script_update_body(settings)
     script_settings     = settings
 
     local was_enabled   = cfg.enabled
@@ -5487,6 +6427,7 @@ function script_update(settings)
         st.runup_logged = nil
     end
     panel_url_check()
+    panel_intent_check()
 
     cfg.max_duration_sec   = obs.obs_data_get_int(settings, "max_duration_sec")
 
@@ -5530,11 +6471,19 @@ function script_save(settings)
     obs.obs_data_set_int(settings, "video_h", st.video_h or 0)
     obs.obs_data_set_int(settings, "last_port", st.last_port or st.port or 0)
     obs.obs_data_set_double(settings, "url_time_sec", st.url_time_sec or -1)
+    obs.obs_data_set_string(settings, "url_time_id", st.url_time_id or "")
     obs.obs_data_set_double(settings, "in_sec", st.in_sec or -1)
     obs.obs_data_set_double(settings, "out_sec", st.out_sec or -1)
+    if st.hk_id ~= nil and obs.obs_hotkey_save then
+        local oka, arr = pcall(obs.obs_hotkey_save, st.hk_id)
+        if oka and arr then
+            obs.obs_data_set_array(settings, "trim_hotkey", arr)
+            obs.obs_data_array_release(arr)
+        end
+    end
 end
 
-function script_load(settings)
+local function script_load_body(settings)
     script_settings = settings
     math.randomseed(os.time())
 
@@ -5577,6 +6526,8 @@ function script_load(settings)
 
     local ut = obs.obs_data_get_double(settings, "url_time_sec")
     if ut and ut >= 0 then st.url_time_sec = ut end
+    local uid = trim(obs.obs_data_get_string(settings, "url_time_id") or "")
+    if uid ~= "" then st.url_time_id = uid end
 
     cfg.yt_url = obs.obs_data_get_string(settings, "yt_url") or ""
 
@@ -5589,6 +6540,7 @@ function script_load(settings)
             st.in_sec and num_str(st.in_sec) or "(not set)",
             st.out_sec and num_str(st.out_sec) or "(not set)")
     end
+    panel_intent_check()
 
     local stale = aud_read_record(settings)
     if #stale > 0 then
@@ -5600,16 +6552,55 @@ function script_load(settings)
 
     latch_program_scene()
 
+    if obs.obs_hotkey_register_frontend then
+        st.hk_fn = function(pressed)
+            if not pressed then return end
+            st.trim_want = true
+        end
+        local okh, hid = pcall(obs.obs_hotkey_register_frontend,
+            "castika_sbr_open_trim", "Castika - open the trim controls", st.hk_fn)
+        if okh and hid ~= nil then
+            st.hk_id = hid
+            local arr = obs.obs_data_get_array(settings, "trim_hotkey")
+            if arr then
+                pcall(obs.obs_hotkey_load, st.hk_id, arr)
+                obs.obs_data_array_release(arr)
+            end
+            log("A global hotkey 'Castika - open the trim controls' is registered. Set a key for it in OBS under Settings - Hotkeys; it works from anywhere in OBS, not only from this panel. The press itself does nothing but raise a flag: this script's 100ms tick opens the window, because the hotkey callback runs on obs-scripting's own defer thread and is not a safe place to do the work.")
+        else
+            st.hk_fn = nil
+        end
+    end
+
     obs.obs_frontend_add_event_callback(on_frontend_event)
     log("Script loaded: %s (nonce %s).", SCRIPT_VERSION, st.nonce)
 
     start_server()
 
+    st.tick_fn = tick
     obs.timer_add(tick, TICK_MS)
     st.timer_on = true
 end
 
-function script_unload()
+function script_properties()
+    local props = guard("script_properties", script_properties_body)
+    if props ~= nil then return props end
+    props = obs.obs_properties_create()
+    cap(props, "halted", string.format(
+        "This script stopped itself in %s. The reason and the stack are in the script log. Reload the script to bring these settings back.",
+        tostring(st.halted or "an entry point")), true)
+    return props
+end
+
+function script_update(settings)
+    return guard("script_update", script_update_body, settings)
+end
+
+function script_load(settings)
+    return guard("script_load", script_load_body, settings)
+end
+
+local function script_unload_body()
     ctl_show_drop()
     aud_restore("the script is being unloaded")
     hv_stop()
@@ -5622,4 +6613,16 @@ function script_unload()
         st.timer_on = false
     end
     obs.obs_frontend_remove_event_callback(on_frontend_event)
+    if st.hk_fn and obs.obs_hotkey_unregister then
+        pcall(obs.obs_hotkey_unregister, st.hk_fn)
+        st.hk_fn = nil
+        st.hk_id = nil
+    end
+end
+
+function script_unload()
+    local ok, err = pcall(script_unload_body)
+    if not ok then
+        logw("script_unload did not finish: %s", tostring(err))
+    end
 end
