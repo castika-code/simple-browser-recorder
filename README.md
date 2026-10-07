@@ -11,8 +11,7 @@ Paste a URL, mark the exact in and out points while watching, and send the scene
 ## Requirements
 
 OBS Studio. Nothing else to install.
-> Tested : Windows 11, OBS 32.2.2 (64bit)
-> Tested : Mac 27.0.1, OBS 32.3.2 (apple silicon)
+> Tested : Windows 11. OBS 32.2.2 (64bit), Mac 27.0.1. OBS 32.3.2 (Apple Silicon)
 
 ## Install
 
