@@ -1,5 +1,5 @@
 -- Castika Simple Browser Recorder (Lua Script)
--- v0.9.43 - 2026-10-07
+-- v1.0.0 - 2026-10-07
 -- Copyright (c) 2026 Castika
 -- Licensed under the Apache License, Version 2.0
 -- https://github.com/Castika-Coce/simple-browser-recorder
@@ -7,7 +7,7 @@
 obs = obslua
 
 local TAG = "[YT Embed Rec]"
-local SCRIPT_VERSION = "v0.9.43 - 2026-10-07"
+local SCRIPT_VERSION = "v1.0.0 - 2026-10-07"
 local TICK_MS = 100
 local EVENT_POLL_EVERY = 1
 local DELIVERY_MS = 21 + 160 + (EVENT_POLL_EVERY * TICK_MS) + 107
@@ -174,6 +174,7 @@ local st = {
 
     rec_card_off    = nil,
     rec_card_t0     = nil,
+    rec_card_dead   = nil,
     rec_card_txt    = nil,
     rec_card_n      = nil,
     fail_card_ms    = nil,
@@ -5045,13 +5046,20 @@ local function rec_card_look(d, txt, fail)
         obs.obs_data_set_int(d, "bk_opacity", 100)
         obs.obs_data_set_bool(d, "outline", true)
         obs.obs_data_set_int(d, "outline_opacity", 100)
+        obs.obs_data_set_int(d, "color1", 0xFF0000FF)
+        obs.obs_data_set_int(d, "color2", 0xFF0000FF)
+        obs.obs_data_set_bool(d, "drop_shadow", true)
         return
     end
-    obs.obs_data_set_int(d, "color", live and 0xFFFFFFFF or 0x00FFFFFF)
+    local ink = live and 0xFFFFFFFF or 0x00FFFFFF
+    obs.obs_data_set_int(d, "color", ink)
     obs.obs_data_set_int(d, "bk_color", 0xFF000000)
     obs.obs_data_set_int(d, "bk_opacity", live and 70 or 0)
     obs.obs_data_set_bool(d, "outline", live)
     obs.obs_data_set_int(d, "outline_opacity", live and 100 or 0)
+    obs.obs_data_set_int(d, "color1", ink)
+    obs.obs_data_set_int(d, "color2", ink)
+    obs.obs_data_set_bool(d, "drop_shadow", live)
 end
 
 local function rec_card_settings(d)
@@ -5059,7 +5067,7 @@ local function rec_card_settings(d)
     local fs = math.floor(ch / 38)
     if fs < 14 then fs = 14 end
     local f = obs.obs_data_create()
-    obs.obs_data_set_string(f, "face", "Consolas")
+    obs.obs_data_set_string(f, "face", PLAT.win and "Consolas" or "Menlo")
     obs.obs_data_set_int(f, "size", fs)
     obs.obs_data_set_int(f, "flags", 1)
     obs.obs_data_set_string(f, "style", "Bold")
@@ -5104,8 +5112,28 @@ local function rec_card_remove()
 end
 
 local function rec_card_ensure()
+    local function id_ok(id)
+        if obs.obs_get_source_output_flags == nil then return true end
+        local okf, f = pcall(obs.obs_get_source_output_flags, id)
+        if not okf then return true end
+        return (tonumber(f) or 0) ~= 0
+    end
     local src = obs.obs_get_source_by_name(REC_CARD_NAME)
-    if src then return src end
+    if src then
+        local was = ""
+        if obs.obs_source_get_id then
+            local oki, v = pcall(obs.obs_source_get_id, src)
+            if oki and type(v) == "string" then was = v end
+        end
+        if was == "" or id_ok(was) then return src end
+        obs.obs_source_release(src)
+        if st.rec_card_dead ~= was then
+            st.rec_card_dead = was
+            log("The REC card was standing as a '%s', which THIS OBS does not have. A source whose type is not registered is shown in RED in the Sources list and its properties cannot be opened - that is OBS reporting a missing type, not a fault in the source. It happens when a scene collection written on one platform is opened on another, because the text source differs between them, and it also happened when this script created the card by an id this build does not carry. It is being replaced now with a text source this OBS does have, in the same place, with the same name. Nothing about the recording changes.",
+                was)
+        end
+        rec_card_remove()
+    end
     if st.rec_card_off then return nil end
     if obs.obs_source_create == nil or obs.obs_scene_add == nil then
         st.rec_card_off = true
@@ -5115,7 +5143,7 @@ local function rec_card_ensure()
     rec_card_settings(d)
     local made = nil
     for _, id in ipairs(REC_CARD_IDS) do
-        if not made then
+        if not made and id_ok(id) then
             local ok, s = pcall(obs.obs_source_create, id, REC_CARD_NAME, d, nil)
             if ok and s then made = s end
         end
