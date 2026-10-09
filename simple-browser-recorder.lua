@@ -1,13 +1,13 @@
 -- Castika Simple Browser Recorder (Lua Script)
--- v1.0.9 - 2026-10-09
+-- v1.1.0 - 2026-10-09
 -- Copyright (c) 2026 Castika
 -- Licensed under the Apache License, Version 2.0
--- https://github.com/Castika-Coce/simple-browser-recorder
+-- https://github.com/castika-code/simple-browser-recorder
 
 obs = obslua
 
 local TAG = "[YT Embed Rec]"
-local SCRIPT_VERSION = "v1.0.9 - 2026-10-09"
+local SCRIPT_VERSION = "v1.1.0 - 2026-10-09"
 local TICK_MS = 100
 local EVENT_POLL_EVERY = 1
 local DELIVERY_MS = 21 + 160 + (EVENT_POLL_EVERY * TICK_MS) + 107
@@ -74,6 +74,7 @@ local cfg = {
     cr_voff         = 0,
 
     loop_mode       = false,
+    update_check    = true,
     auto_convert    = true,
     stop_delay_ms   = 2000,
 }
@@ -203,6 +204,15 @@ local st = {
     aud_on          = nil,
     aud_delay_ms    = nil,
     aud_delay_why   = nil,
+
+    upd_at          = nil,
+    upd_tag         = nil,
+    upd_ver         = nil,
+    upd_told        = nil,
+    upd_busy_ms     = nil,
+    upd_force       = nil,
+    upd_fail_at     = nil,
+    upd_fail_said   = nil,
 
     hv_size         = nil,
 }
@@ -375,6 +385,7 @@ local function paths()
         port   = join(d, "yt_port.txt"),
         beat   = join(d, "yt_beat.txt"),
         probe_req = join(d, "yt_probe_req.txt"),
+        update_req = join(d, "yt_update_req.txt"),
         go     = join(d, "yt_go.flag"),
         ctl    = join(d, "yt_ctl.flag"),
         owner  = join(d, "yt_owner.txt"),
@@ -523,6 +534,10 @@ local PLAYER_HTML = [==[
   #ctlhk{font-size:.56em;color:#7c8794;letter-spacing:.06em;line-height:1.5;
          margin:0 .9em .3em;text-align:left}
   #ctlhk b{font-weight:700;color:#9aa6b3;letter-spacing:.09em}
+  #ctlupd{display:none;font-size:.6em;font-weight:700;letter-spacing:.06em;
+          line-height:1.4;margin:0 .9em .3em;padding:.35em .6em;
+          border:.1em solid #4d93d6;border-radius:.3em;background:#4d93d62e;
+          color:#9fcdf5;text-align:left}
   #ctlsl.ctlaim{cursor:crosshair}
   #ctlsl .ctlh.ctlarm{outline:.16em solid #fff;outline-offset:.08em;z-index:4}
   #ctlsl.ctlwait{opacity:.4}
@@ -667,6 +682,7 @@ local PLAYER_HTML = [==[
     <div id="ctlhk">OPEN THIS WINDOW INSTANTLY FROM A HOTKEY -
       ASSIGN ONE IN OBS <b>SETTINGS &gt; HOTKEYS</b> UNDER
       <b>CASTIKA - OPEN THE TRIM CONTROLS</b></div>
+    <div id="ctlupd"></div>
     <div id="ctlmark"><b>Castika Simple Browser Recorder</b>
       <i>Copyright (c) 2026 Castika - Licensed under the Apache License, Version 2.0</i></div>
   </div>
@@ -701,6 +717,8 @@ local PLAYER_HTML = [==[
   var TOUT   = parseFloat(qs.get('tout') || '0');
   if (!(TOUT > 0)) { TOUT = 0; }
   if (TOUT > 0 && TOUT <= TIN) { TOUT = 0; }
+  var UPDTAG = qs.get('upd') || '';
+  if (!/^v\d{1,9}(\.\d{1,9}){1,3}$/.test(UPDTAG)) { UPDTAG = ''; }
   var FR     = 1 / FPS;
   var LOOP   = qs.get('loop') !== '0';
   var CR_ON   = qs.get('cr') === '1';
@@ -1211,6 +1229,14 @@ local PLAYER_HTML = [==[
     try {
       b.querySelector('em').textContent = txt;
       b.classList.toggle('ctlbad', bad);
+    } catch (x) {}
+  }
+  function ctlUpdPaint(){
+    var el = ctlE('ctlupd');
+    if (!el || UPDTAG === '') { return; }
+    try {
+      el.textContent = 'UPDATE AVAILABLE - ' + UPDTAG + ' IS OUT - GITHUB.COM/CASTIKA-CODE/SIMPLE-BROWSER-RECORDER';
+      el.style.display = 'block';
     } catch (x) {}
   }
   function ctlConfirmFlash(msg, bad){
@@ -1979,6 +2005,7 @@ local PLAYER_HTML = [==[
     ctlWire();
     ctlSeedRange();
     ctlConfirmPaint();
+    ctlUpdPaint();
     try { ctlDurV = player ? (player.getDuration() || 0) : 0; } catch (x) {}
     ctlSeedOut();
     ctlPaint();
@@ -2355,6 +2382,8 @@ my $OwnerGoneSec = 20;
 my $MaxHours = 12;
 my $ProbeOnly = 0;
 my $Vid = '';
+my $UpdateReq = '';
+my $UpdateOnly = 0;
 
 GetOptions(
   'PreferredPort=i' => \$PreferredPort,
@@ -2373,6 +2402,8 @@ GetOptions(
   'MaxHours=i'      => \$MaxHours,
   'ProbeOnly'       => \$ProbeOnly,
   'Vid=s'           => \$Vid,
+  'UpdateReq=s'     => \$UpdateReq,
+  'UpdateOnly'      => \$UpdateOnly,
 ) or die "bad arguments\n";
 
 $Root = abs_path($Root) || $Root;
@@ -2383,6 +2414,7 @@ $Log      = under('yt_server.log')  unless $Log;
 $PortFile = under('yt_port.txt')    unless $PortFile;
 $Beat     = under('yt_beat.txt')    unless $Beat;
 $ProbeReq = under('yt_probe_req.txt') unless $ProbeReq;
+$UpdateReq = under('yt_update_req.txt') unless $UpdateReq;
 $Go       = under('yt_go.flag')     unless $Go;
 $Ctl      = under('yt_ctl.flag')    unless $Ctl;
 $Owner    = under('yt_owner.txt')   unless $Owner;
@@ -2493,6 +2525,29 @@ sub checkProbeRequest {
   }
 }
 
+sub spawnUpdate {
+  my $pid = fork();
+  if (!defined $pid) {
+    say_log('update worker could not be spawned');
+    appendEvent('type=update&err=1');
+    return;
+  }
+  if ($pid == 0) {
+    exec($^X, $SelfPath, '-UpdateOnly', '-Root', $Root,
+         '-Events', $Events, '-Log', $Log);
+    exit 127;
+  }
+  say_log('update worker spawned');
+}
+
+sub checkUpdateRequest {
+  return unless $UpdateReq;
+  return unless -e $UpdateReq;
+  unlink($UpdateReq);
+  say_log('update check requested by file');
+  spawnUpdate();
+}
+
 sub goAnswer {
   my ($want) = @_;
   return 'go=0' unless $Go;
@@ -2560,6 +2615,17 @@ sub fetch_url {
   return defined($body) ? $body : '';
 }
 
+sub fetch_release {
+  my $pid = open(my $fh, '-|', 'curl', '-sS', '--max-time', '8',
+                 '-A', 'simple-browser-recorder-update-check', '--',
+                 'https://api.github.com/repos/castika-code/simple-browser-recorder/releases/latest');
+  return '' unless $pid;
+  local $/;
+  my $body = <$fh>;
+  close $fh;
+  return defined($body) ? $body : '';
+}
+
 if ($ProbeOnly) {
   $seq = 0;
   my $tag = goodVid($Vid) ? "&pv=$Vid" : '';
@@ -2588,6 +2654,24 @@ if ($ProbeOnly) {
   } else {
     appendEvent("type=probe&err=1$tag$ahq");
     say_log('probe worker: native size not found (best-effort, ignored)');
+  }
+  exit 0;
+}
+
+if ($UpdateOnly) {
+  $seq = 0;
+  my $tag = '';
+  my $body = fetch_release();
+  if ($body !~ /"(?:draft|prerelease)"\s*:\s*true/
+      && $body =~ /"tag_name"\s*:\s*"([A-Za-z0-9._\-]{1,32})"/) {
+    $tag = $1;
+  }
+  if ($tag ne '') {
+    appendEvent("type=update&tag=$tag");
+    say_log("update worker: latest release $tag");
+  } else {
+    appendEvent('type=update&err=1');
+    say_log('update worker: no usable answer (best-effort, ignored)');
   }
   exit 0;
 }
@@ -2685,6 +2769,7 @@ my $houseKeep = sub {
   beat(0);
   checkProbeRequest();
   return 'stop' if -e $Stop;
+  checkUpdateRequest();
   my $lost = ownerLost();
   if ($lost ne '') { say_log("exiting: $lost"); $ownerGone = 1; return 'owner'; }
   if (time() > $deadline) { say_log('max lifetime reached'); return 'deadline'; }
@@ -2796,7 +2881,9 @@ param(
   [int]$OwnerGoneSec = 20,
   [int]$MaxHours = 12,
   [switch]$ProbeOnly,
-  [string]$Vid = ''
+  [string]$Vid = '',
+  [string]$UpdateReq = '',
+  [switch]$UpdateOnly
 )
 
 $Root = (Resolve-Path -LiteralPath $Root).Path
@@ -2806,6 +2893,7 @@ if (-not $Log)      { $Log      = Join-Path $Root 'yt_server.log' }
 if (-not $PortFile) { $PortFile = Join-Path $Root 'yt_port.txt' }
 if (-not $Beat)     { $Beat     = Join-Path $Root 'yt_beat.txt' }
 if (-not $ProbeReq) { $ProbeReq = Join-Path $Root 'yt_probe_req.txt' }
+if (-not $UpdateReq) { $UpdateReq = Join-Path $Root 'yt_update_req.txt' }
 if (-not $Go)       { $Go       = Join-Path $Root 'yt_go.flag' }
 if (-not $Ctl)      { $Ctl      = Join-Path $Root 'yt_ctl.flag' }
 if (-not $Owner)    { $Owner    = Join-Path $Root 'yt_owner.txt' }
@@ -2910,6 +2998,38 @@ function checkProbeRequest() {
   } else {
     say 'probe request file ignored (no usable video id)'
   }
+}
+
+function spawnUpdate() {
+  $launched = $false
+  try {
+    $uargs = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
+             $script:SelfPath + '" -UpdateOnly -Root "' + $Root +
+             '" -Events "' + $Events + '" -Log "' + $Log + '"'
+    Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' `
+      -ArgumentList $uargs -ErrorAction Stop
+    $launched = $true
+    say 'update worker spawned'
+  } catch {
+    $launched = $false
+  }
+  if (-not $launched) {
+    say 'update worker could not be spawned'
+    [void](appendEvent 'type=update&err=1')
+  }
+}
+
+function checkUpdateRequest() {
+  if (-not $UpdateReq) { return }
+  try {
+    if (-not (Test-Path -LiteralPath $UpdateReq)) { return }
+    Remove-Item -LiteralPath $UpdateReq -Force
+  } catch {
+    try { Remove-Item -LiteralPath $UpdateReq -Force } catch {}
+    return
+  }
+  say 'update check requested by file'
+  spawnUpdate
 }
 
 function goAnswer($want) {
@@ -3033,6 +3153,37 @@ if ($ProbeOnly) {
   exit 0
 }
 
+if ($UpdateOnly) {
+  $script:seq = 0
+  $tag = ''
+  try {
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    Add-Type -AssemblyName System.Net.Http
+    $hc = New-Object System.Net.Http.HttpClient
+    $hc.Timeout = [TimeSpan]::FromSeconds(8)
+    $hc.DefaultRequestHeaders.UserAgent.ParseAdd('simple-browser-recorder-update-check')
+    $body = [string]$hc.GetStringAsync('https://api.github.com/repos/castika-code/simple-browser-recorder/releases/latest').GetAwaiter().GetResult()
+    if (-not [regex]::IsMatch($body, '"(draft|prerelease)"\s*:\s*true')) {
+      $m = [regex]::Match($body, '"tag_name"\s*:\s*"([A-Za-z0-9._-]{1,32})"')
+      if ($m.Success) { $tag = $m.Groups[1].Value }
+    }
+  } catch {
+    $tag = ''
+  }
+  try {
+    if ($tag -ne '') {
+      [void](appendEvent "type=update&tag=$tag")
+      say "update worker: latest release $tag"
+    } else {
+      [void](appendEvent 'type=update&err=1')
+      say 'update worker: no usable answer (best-effort, ignored)'
+    }
+  } catch {
+    try { [void](appendEvent 'type=update&err=1') } catch {}
+  }
+  exit 0
+}
+
 if (Test-Path -LiteralPath $Stop)     { Remove-Item -LiteralPath $Stop -Force }
 if (Test-Path -LiteralPath $PortFile) { Remove-Item -LiteralPath $PortFile -Force }
 if (Test-Path -LiteralPath $Beat)     { Remove-Item -LiteralPath $Beat -Force }
@@ -3096,6 +3247,7 @@ function houseKeep() {
   beat $false
   checkProbeRequest
   if (Test-Path -LiteralPath $Stop) { return 'stop' }
+  checkUpdateRequest
   $lost = ownerLost
   if ($lost -ne '') { say "exiting: $lost"; $script:ownerGone = $true; return 'owner' }
   if ((Get-Date) -gt $script:deadline) { say 'max lifetime reached'; return 'deadline' }
@@ -3258,6 +3410,8 @@ local function start_server()
     remove_quiet(p.events)
     remove_quiet(p.port)
     remove_quiet(p.beat)
+    remove_quiet(p.update_req)
+    st.upd_busy_ms = nil
     remove_quiet(p.probe_req)
     st.probe_asked_for = nil
     remove_quiet(p.go)
@@ -3286,9 +3440,9 @@ local function start_server()
             'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""%s"" ' ..
             '-PreferredPort %d -PortFile ""%s"" -Root ""%s"" -Events ""%s"" ' ..
             '-Stop ""%s"" -Log ""%s"" -Beat ""%s"" -ProbeReq ""%s"" -Go ""%s"" ' ..
-            '-Ctl ""%s"" -Owner ""%s"" -OwnerId %s',
+            '-Ctl ""%s"" -Owner ""%s"" -OwnerId %s -UpdateReq ""%s""',
             p.ps1, st.last_port or 0, p.port, p.dir, p.events, p.stop, p.slog,
-            p.beat, p.probe_req, p.go, p.ctl, p.owner, st.launch_id)
+            p.beat, p.probe_req, p.go, p.ctl, p.owner, st.launch_id, p.update_req)
         local vbs = string.format(
             'Set sh = CreateObject("WScript.Shell")\r\nsh.Run "%s", 0, False\r\n', ps_cmd)
         if not write_file(p.vbs, vbs) then
@@ -3300,9 +3454,9 @@ local function start_server()
         launch = string.format(
             'nohup perl "%s" -PreferredPort %d -PortFile "%s" -Root "%s" ' ..
             '-Events "%s" -Stop "%s" -Log "%s" -Beat "%s" -ProbeReq "%s" ' ..
-            '-Go "%s" -Ctl "%s" -Owner "%s" -OwnerId %s >/dev/null 2>&1 &',
+            '-Go "%s" -Ctl "%s" -Owner "%s" -OwnerId %s -UpdateReq "%s" >/dev/null 2>&1 &',
             p.pl, st.last_port or 0, p.port, p.dir, p.events, p.stop, p.slog,
-            p.beat, p.probe_req, p.go, p.ctl, p.owner, st.launch_id)
+            p.beat, p.probe_req, p.go, p.ctl, p.owner, st.launch_id, p.update_req)
     end
 
     -- per Lua 5.1 ref: io.popen does not wait
@@ -3522,6 +3676,141 @@ local function request_probe(vid)
     end
 end
 
+local UPD = { DAY_S = 86400, AGAIN_S = 3600, WAIT_MS = 30000 }
+
+function UPD.parse(s)
+    s = trim(s):lower()
+    if s:sub(1, 1) == "v" then s = s:sub(2) end
+    local parts = {}
+    for d in (s .. "."):gmatch("([^.]*)%.") do
+        if not d:match("^%d+$") or #d > 9 then return nil end
+        parts[#parts + 1] = tonumber(d)
+    end
+    if #parts < 2 or #parts > 4 then return nil end
+    return parts
+end
+
+function UPD.cmp(a, b)
+    for i = 1, math.max(#a, #b) do
+        local x, y = a[i] or 0, b[i] or 0
+        if x ~= y then return (x < y) and -1 or 1 end
+    end
+    return 0
+end
+
+function UPD.name(parts)
+    return "v" .. table.concat(parts, ".")
+end
+
+function UPD.newer(tag, running)
+    local a = UPD.parse(tag)
+    local b = UPD.parse(tostring(running or ""):match("^%S+"))
+    if not a or not b then return false end
+    return UPD.cmp(a, b) > 0
+end
+
+function UPD.banner()
+    if not cfg.update_check then return nil end
+    if not UPD.newer(st.upd_tag, SCRIPT_VERSION) then return nil end
+    return UPD.name(UPD.parse(st.upd_tag))
+end
+
+function UPD.load(settings)
+    st.upd_at   = obs.obs_data_get_int(settings, "upd_at") or 0
+    st.upd_tag  = obs.obs_data_get_string(settings, "upd_tag") or ""
+    st.upd_ver  = obs.obs_data_get_string(settings, "upd_ver") or ""
+    st.upd_told = obs.obs_data_get_bool(settings, "upd_told")
+end
+
+function UPD.save(settings)
+    obs.obs_data_set_int(settings, "upd_at", st.upd_at or 0)
+    obs.obs_data_set_string(settings, "upd_tag", st.upd_tag or "")
+    obs.obs_data_set_string(settings, "upd_ver", st.upd_ver or "")
+    obs.obs_data_set_bool(settings, "upd_told", st.upd_told and true or false)
+end
+
+function UPD.due(now)
+    if not cfg.update_check or not cfg.enabled then return false end
+    if st.upd_busy_ms then return false end
+    if st.upd_force then return true end
+    local f = st.upd_fail_at
+    if f and now >= f and now - f < UPD.AGAIN_S then return false end
+    if st.upd_ver ~= SCRIPT_VERSION then return true end
+    local at = st.upd_at or 0
+    return at <= 0 or now < at or now - at >= UPD.DAY_S
+end
+
+function UPD.request(now)
+    if not st.server_launched or not UPD.due(now) then return false end
+    if not write_file(paths().update_req, "1\r\n") then return false end
+    st.upd_force = nil
+    st.upd_busy_ms = UPD.WAIT_MS
+    log("Update check: asking GitHub which release is newest. The local server's own worker asks, as a separate process with its own time limit, so nothing in this script waits on the network. If no answer comes back within %d seconds the request is dropped without a word on screen.",
+        UPD.WAIT_MS / 1000)
+    return true
+end
+
+function UPD.failed(why)
+    st.upd_busy_ms = nil
+    st.upd_fail_at = os.time()
+    if st.upd_fail_said then return end
+    st.upd_fail_said = true
+    log("Update check: %s. That is not a fault - there may be no network, GitHub may be blocked or limiting requests, or its answer may not have been understood. Nothing is shown anywhere and nothing is changed. It is tried again after an hour at the earliest, and this line is said once per session.",
+        why)
+end
+
+function UPD.tick()
+    st.upd_busy_ms = st.upd_busy_ms - TICK_MS
+    if st.upd_busy_ms <= 0 then UPD.failed("no answer arrived in time") end
+end
+
+function UPD.answer(line)
+    if not cfg.update_check then return end
+    local tag = line:match("&tag=([%w%._%-]+)%s*$")
+    if line:find("&err=1", 1, true) or not tag then
+        UPD.failed("the worker got no usable answer from GitHub")
+        return
+    end
+    st.upd_busy_ms = nil
+    st.upd_fail_at = nil
+    st.upd_fail_said = nil
+    st.upd_at, st.upd_tag, st.upd_ver = os.time(), tag, SCRIPT_VERSION
+    if script_settings then UPD.save(script_settings) end
+    local parts = UPD.parse(tag)
+    if not parts then
+        log("Update check: GitHub's newest release is named '%s', which is not a version number, so it is ignored.",
+            tag)
+    elseif UPD.newer(tag, SCRIPT_VERSION) then
+        log("Update check: GitHub's newest release is %s and this is %s, so the trim controls will show a blue banner saying a newer version is out. It appears the next time the controls are opened.",
+            UPD.name(parts), SCRIPT_VERSION)
+    else
+        log("Update check: GitHub's newest release is %s and this is %s, so nothing newer is out and there is no banner. It is asked again in a day, or when this version changes, or when the setting is switched off and on.",
+            UPD.name(parts), SCRIPT_VERSION)
+    end
+end
+
+function UPD.tell()
+    if st.upd_told or not cfg.update_check then return end
+    st.upd_told = true
+    if script_settings then UPD.save(script_settings) end
+    log("UPDATE CHECK IS ON, as it is by default. Once a day, and again whenever this script's version changes, the local server asks GitHub (https://api.github.com/repos/castika-code/simple-browser-recorder/releases/latest, a public page) which release is newest, and when that is newer than this one the trim controls show a blue banner saying so. Until this version the only site this script contacted was YouTube. The request carries no video, key or account of yours; GitHub sees this machine's address as any website would. The switch is 'Tell me in the trim controls when a newer version is out' at the bottom of this script's settings: off means no request at all, and off then on again checks at once. This line is said once.")
+end
+
+function UPD.switched(was)
+    if cfg.update_check == was then return end
+    st.upd_busy_ms = nil
+    if cfg.update_check then
+        st.upd_force = true
+        st.upd_fail_at = nil
+        st.upd_fail_said = nil
+        UPD.tell()
+    else
+        st.upd_force = nil
+        remove_quiet(paths().update_req)
+        log("Update check is OFF. No request is made and the trim controls show no banner. Switch it back on and a check is made at once.")
+    end
+end
+
 local function build_page_url(video_id)
     if not st.port then return nil end
     local gate = runup_target_sec()
@@ -3573,6 +3862,10 @@ local function build_page_url(video_id)
         if (cfg.cr_mode == "h" or cfg.cr_mode == "yh") and st.cr_handle and st.cr_handle ~= "" then
             u = u .. "&crh=" .. url_enc(st.cr_handle)
         end
+    end
+    if cfg.update_check then
+        local ub = UPD.banner()
+        if ub then u = u .. "&upd=" .. url_enc(ub) end
     end
     return u
 end
@@ -5896,6 +6189,8 @@ local function poll_events()
                     end
                     st.apply_pending = true
                     log("This range is stored. The trim controls STAY UP - confirming no longer reloads the page - so you can listen, adjust, and confirm again. The recording page is rewritten with whatever was confirmed last, either as soon as the controls go away or at the latest when this source goes to Program, so no take runs on an old range.")
+                elseif etype == "update" then
+                    UPD.answer(line)
                 elseif etype == "bad_param" then
                     local which = line:match("which=([%w_]+)") or "?"
                     log("The player page loaded with no usable '%s' value in its URL, so nothing can play. The source URL is stale; it is rewritten the next time the source is off program and not recording.",
@@ -6031,6 +6326,8 @@ local function tick_body()
     hv_poll()
 
     rec_card_update()
+
+    if st.upd_busy_ms then UPD.tick() end
 
     service_trim()
 
@@ -6226,6 +6523,7 @@ local function on_frontend_event_body(event)
         service_create()
         service_return()
         service_trim()
+        UPD.request(os.time())
     end
     if event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED then
         local ours = st.fe_ours or st.fe_stop_asked
@@ -6272,6 +6570,7 @@ end
 
 function script_defaults(settings)
     obs.obs_data_set_default_bool(settings, "enabled", true)
+    obs.obs_data_set_default_bool(settings, "update_check", true)
 
     obs.obs_data_set_default_bool(settings, "fit_canvas", true)
     obs.obs_data_set_default_string(settings, "res_mode", "canvas")
@@ -6503,6 +6802,9 @@ local function script_properties_body()
     obs.obs_properties_add_group(props, "grp_rec", "Safety limit",
         obs.OBS_GROUP_NORMAL, grec)
 
+    obs.obs_properties_add_bool(props, "update_check",
+        "Tell me in the trim controls when a newer version is out - asks GitHub once a day")
+
     apply_take_lock(props)
     refresh_visibility(props, script_settings)
     return props
@@ -6551,6 +6853,10 @@ local function script_update_body(settings)
         st.prev_active    = false
         log("Script enabled.")
     end
+
+    local was_upd       = cfg.update_check
+    cfg.update_check    = obs.obs_data_get_bool(settings, "update_check")
+    UPD.switched(was_upd)
 
     cfg.fit_canvas      = obs.obs_data_get_bool(settings, "fit_canvas")
     cfg.res_mode        = obs.obs_data_get_string(settings, "res_mode")
@@ -6606,6 +6912,8 @@ local function script_update_body(settings)
         obs.obs_data_release(fo)
     end
 
+    UPD.request(os.time())
+
     st.apply_pending    = true
     st.create_want      = true
 
@@ -6615,6 +6923,7 @@ local function script_update_body(settings)
 end
 
 function script_save(settings)
+    UPD.save(settings)
     obs.obs_data_set_string(settings, "nonce", st.nonce or "")
     obs.obs_data_set_string(settings, "video_id", st.video_id or "")
     obs.obs_data_set_int(settings, "video_w", st.video_w or 0)
@@ -6681,6 +6990,9 @@ local function script_load_body(settings)
 
     cfg.yt_url = obs.obs_data_get_string(settings, "yt_url") or ""
 
+    cfg.update_check = obs.obs_data_get_bool(settings, "update_check")
+    UPD.load(settings)
+
     local isec = obs.obs_data_get_double(settings, "in_sec")
     if isec and isec > 0 then st.in_sec = isec end
     local osec = obs.obs_data_get_double(settings, "out_sec")
@@ -6724,6 +7036,7 @@ local function script_load_body(settings)
 
     obs.obs_frontend_add_event_callback(on_frontend_event)
     log("Script loaded: %s (nonce %s).", SCRIPT_VERSION, st.nonce)
+    UPD.tell()
 
     start_server()
 
