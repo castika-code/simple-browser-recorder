@@ -1,5 +1,5 @@
 -- Castika Simple Browser Recorder (Lua Script)
--- v1.0.0 - 2026-10-07
+-- v1.0.7 - 2026-10-09
 -- Copyright (c) 2026 Castika
 -- Licensed under the Apache License, Version 2.0
 -- https://github.com/Castika-Coce/simple-browser-recorder
@@ -7,7 +7,7 @@
 obs = obslua
 
 local TAG = "[YT Embed Rec]"
-local SCRIPT_VERSION = "v1.0.0 - 2026-10-07"
+local SCRIPT_VERSION = "v1.0.7 - 2026-10-09"
 local TICK_MS = 100
 local EVENT_POLL_EVERY = 1
 local DELIVERY_MS = 21 + 160 + (EVENT_POLL_EVERY * TICK_MS) + 107
@@ -248,13 +248,17 @@ local function guard(where, fn, arg, strict)
     local ms = t0 and (now_ms() - t0) or nil
     if not ms then return res end
     if ms > st.slow_worst then st.slow_worst = ms end
-    if strict and ms >= TICK_GUARD.halt_ms then
-        st.slow_hits = st.slow_hits + 1
-        if st.slow_hits >= TICK_GUARD.hits then
-            halt(where, string.format(
-                "it blocked for %.0fms, and that is the %d time. One pass is budgeted %dms and it runs on the thread OBS draws with, so OBS was frozen for that long each time. One slow pass can be the disk; this many is a blocking call.",
-                ms, st.slow_hits, TICK_MS))
-            return nil
+    if strict then
+        if ms >= TICK_GUARD.halt_ms then
+            st.slow_hits = st.slow_hits + 1
+            if st.slow_hits >= TICK_GUARD.hits then
+                halt(where, string.format(
+                    "it blocked for %.0fms, and that is %d passes in a row. One pass is budgeted %dms and it runs on the thread OBS draws with, so OBS was frozen for that long each time. One slow pass can be the disk, or the machine coming back from sleep with a pass still open; this many in a row is a blocking call.",
+                    ms, st.slow_hits, TICK_MS))
+                return nil
+            end
+        else
+            st.slow_hits = 0
         end
     end
     if ms <= (strict and TICK_WARN_MS or TICK_GUARD.ui_ms) then return res end
@@ -444,8 +448,10 @@ local PLAYER_HTML = [==[
 <html><head><meta charset="utf-8"><title>OBS YouTube Player</title>
 <style>
   html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hidden}
-  #win{position:absolute;top:0;left:0;right:0;bottom:0;overflow:hidden;background:#000}
-  #player{position:absolute;left:0;top:0;width:100%;height:100%;border:0;pointer-events:none}
+  #win{position:absolute;top:0;left:0;right:0;bottom:0;overflow:hidden;
+       background:#000}
+  #player{position:absolute;left:0;top:0;width:100%;height:100%;border:0;
+          pointer-events:none}
 
   #cred{position:absolute;z-index:5;display:none;max-width:76%;box-sizing:border-box;
         pointer-events:none;line-height:1.3;white-space:pre-wrap;
@@ -542,9 +548,8 @@ local PLAYER_HTML = [==[
               font-size:.7em;min-height:3.8em;min-width:0;padding:0 .4em;
               flex:1 1 3.2em;display:inline-flex;align-items:center;
               justify-content:center;gap:.25em;
-              transition:background .06s linear,transform .06s linear}
-  #ctl button:active,#ctl button.ctlpress{background:#4d93d6;
-              transform:translateY(.1em)}
+              transition:background .06s linear}
+  #ctl button:active,#ctl button.ctlpress{background:#4d93d6}
   #ctl button.ctlon{background:#4d93d6;color:#06121d}
   #ctl button.ctlgo{background:#2e7d4f;flex:0 0 14.6em;width:14.6em;
               max-width:100%}
@@ -591,46 +596,46 @@ local PLAYER_HTML = [==[
     <div id="ctlsl">
       <div class="ctltrk"></div>
       <div id="ctlband" style="left:0%;width:100%"></div>
-      <div class="ctlh" id="ctlhi" title="IN" style="left:0%"></div>
-      <div class="ctlh" id="ctlho" title="OUT" style="left:100%"></div>
-      <div id="ctlph" title="playhead" style="left:0%"></div>
+      <div class="ctlh" id="ctlhi" aria-label="IN" style="left:0%"></div>
+      <div class="ctlh" id="ctlho" aria-label="OUT" style="left:100%"></div>
+      <div id="ctlph" aria-label="playhead" style="left:0%"></div>
     </div>
     <div class="ctlrow" id="ctltake">
       <div class="ctlgrp">
         <div class="ctlbtns">
-          <button id="ctltin" title="take the playhead position as IN"><svg viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 20h16"/></svg></button>
+          <button id="ctltin" aria-label="take the playhead position as IN"><svg viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 20h16"/></svg></button>
         </div>
       </div>
       <div class="ctlgap"></div>
       <div class="ctlgrp">
         <div class="ctlbtns">
-          <button id="ctltout" title="take the playhead position as OUT"><svg viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 20h16"/></svg></button>
+          <button id="ctltout" aria-label="take the playhead position as OUT"><svg viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 20h16"/></svg></button>
         </div>
       </div>
     </div>
     <div class="ctlrow">
       <div class="ctlgrp ctli">
         <div class="ctlbtns">
-          <button id="ctlim1" data-n="in,-1" title="IN -1s"><svg viewBox="0 0 24 24"><path d="M19 12H5"/><path d="M11 6l-6 6 6 6"/></svg><em>1S</em></button>
-          <button id="ctlimf10" data-n="in,-10f" title="IN -10 frames"><svg viewBox="0 0 24 24"><path d="M11 6l-6 6 6 6"/><path d="M18 6l-6 6 6 6"/></svg><em>10F</em></button>
-          <button id="ctlimf1" data-n="in,-1f" title="IN -1 frame"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg><em>1F</em></button>
-          <button id="ctlhin" title="go to IN and zoom the slider to the range"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M15.5 15.5L20.5 20.5"/></svg><em>ZOOM</em></button>
-          <button id="ctlipf1" data-n="in,1f" title="IN +1 frame"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg><em>1F</em></button>
-          <button id="ctlipf10" data-n="in,10f" title="IN +10 frames"><svg viewBox="0 0 24 24"><path d="M6 6l6 6-6 6"/><path d="M13 6l6 6-6 6"/></svg><em>10F</em></button>
-          <button id="ctlip1" data-n="in,1" title="IN +1s"><svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg><em>1S</em></button>
+          <button id="ctlim1" data-n="in,-1" aria-label="IN -1s"><svg viewBox="0 0 24 24"><path d="M19 12H5"/><path d="M11 6l-6 6 6 6"/></svg><em>1S</em></button>
+          <button id="ctlimf10" data-n="in,-10f" aria-label="IN -10 frames"><svg viewBox="0 0 24 24"><path d="M11 6l-6 6 6 6"/><path d="M18 6l-6 6 6 6"/></svg><em>10F</em></button>
+          <button id="ctlimf1" data-n="in,-1f" aria-label="IN -1 frame"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg><em>1F</em></button>
+          <button id="ctlhin" aria-label="go to IN and zoom the slider to the range"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M15.5 15.5L20.5 20.5"/></svg><em>ZOOM</em></button>
+          <button id="ctlipf1" data-n="in,1f" aria-label="IN +1 frame"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg><em>1F</em></button>
+          <button id="ctlipf10" data-n="in,10f" aria-label="IN +10 frames"><svg viewBox="0 0 24 24"><path d="M6 6l6 6-6 6"/><path d="M13 6l6 6-6 6"/></svg><em>10F</em></button>
+          <button id="ctlip1" data-n="in,1" aria-label="IN +1s"><svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg><em>1S</em></button>
         </div>
         <div class="ctlul"></div>
       </div>
       <div class="ctlgap"></div>
       <div class="ctlgrp ctlo">
         <div class="ctlbtns">
-          <button id="ctlom1" data-n="out,-1" title="OUT -1s"><svg viewBox="0 0 24 24"><path d="M19 12H5"/><path d="M11 6l-6 6 6 6"/></svg><em>1S</em></button>
-          <button id="ctlomf10" data-n="out,-10f" title="OUT -10 frames"><svg viewBox="0 0 24 24"><path d="M11 6l-6 6 6 6"/><path d="M18 6l-6 6 6 6"/></svg><em>10F</em></button>
-          <button id="ctlomf1" data-n="out,-1f" title="OUT -1 frame"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg><em>1F</em></button>
-          <button id="ctlhout" title="go to OUT and zoom the slider to the range"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M15.5 15.5L20.5 20.5"/></svg><em>ZOOM</em></button>
-          <button id="ctlopf1" data-n="out,1f" title="OUT +1 frame"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg><em>1F</em></button>
-          <button id="ctlopf10" data-n="out,10f" title="OUT +10 frames"><svg viewBox="0 0 24 24"><path d="M6 6l6 6-6 6"/><path d="M13 6l6 6-6 6"/></svg><em>10F</em></button>
-          <button id="ctlop1" data-n="out,1" title="OUT +1s"><svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg><em>1S</em></button>
+          <button id="ctlom1" data-n="out,-1" aria-label="OUT -1s"><svg viewBox="0 0 24 24"><path d="M19 12H5"/><path d="M11 6l-6 6 6 6"/></svg><em>1S</em></button>
+          <button id="ctlomf10" data-n="out,-10f" aria-label="OUT -10 frames"><svg viewBox="0 0 24 24"><path d="M11 6l-6 6 6 6"/><path d="M18 6l-6 6 6 6"/></svg><em>10F</em></button>
+          <button id="ctlomf1" data-n="out,-1f" aria-label="OUT -1 frame"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg><em>1F</em></button>
+          <button id="ctlhout" aria-label="go to OUT and zoom the slider to the range"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M15.5 15.5L20.5 20.5"/></svg><em>ZOOM</em></button>
+          <button id="ctlopf1" data-n="out,1f" aria-label="OUT +1 frame"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg><em>1F</em></button>
+          <button id="ctlopf10" data-n="out,10f" aria-label="OUT +10 frames"><svg viewBox="0 0 24 24"><path d="M6 6l6 6-6 6"/><path d="M13 6l6 6-6 6"/></svg><em>10F</em></button>
+          <button id="ctlop1" data-n="out,1" aria-label="OUT +1s"><svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg><em>1S</em></button>
         </div>
         <div class="ctlul"></div>
       </div>
@@ -638,16 +643,16 @@ local PLAYER_HTML = [==[
     <div class="ctlrow">
       <div class="ctlgrp">
         <div class="ctlbtns">
-          <button id="ctlpp" title="play / pause"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg><em>PREVIEW</em></button>
+          <button id="ctlpp" aria-label="play / pause"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg><em>PREVIEW</em></button>
         </div>
       </div>
       <div class="ctlgap"></div>
       <div class="ctlgrp">
         <div class="ctlbtns">
-          <button id="ctlprange" title="range: confine playback to the in-out range"><svg viewBox="0 0 24 24"><path d="M4 4v16"/><path d="M20 4v16"/><path d="M8 12h.01"/><path d="M12 12h.01"/><path d="M16 12h.01"/></svg></button>
-          <button id="ctlloop" class="ctlon" title="loop: at the end, start again instead of stopping"><svg viewBox="0 0 24 24"><path d="M4 12V9a3 3 0 013-3h13"/><path d="M17 3l3 3-3 3"/><path d="M20 12v3a3 3 0 01-3 3H4"/><path d="M7 21l-3-3 3-3"/></svg></button>
-          <button id="ctlmute" title="sound"><svg viewBox="0 0 24 24"><path d="M5 9v6h4l5 4V5L9 9z"/><path d="M17 9a4 4 0 010 6"/></svg></button>
-          <button id="ctlconfirm" class="ctlgo" title="confirm to OBS"><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg><em>CONFIRM TO OBS</em></button>
+          <button id="ctlprange" aria-label="range: confine playback to the in-out range"><svg viewBox="0 0 24 24"><path d="M4 4v16"/><path d="M20 4v16"/><path d="M8 12h.01"/><path d="M12 12h.01"/><path d="M16 12h.01"/></svg></button>
+          <button id="ctlloop" class="ctlon" aria-label="loop: at the end, start again instead of stopping"><svg viewBox="0 0 24 24"><path d="M4 12V9a3 3 0 013-3h13"/><path d="M17 3l3 3-3 3"/><path d="M20 12v3a3 3 0 01-3 3H4"/><path d="M7 21l-3-3 3-3"/></svg></button>
+          <button id="ctlmute" aria-label="sound"><svg viewBox="0 0 24 24"><path d="M5 9v6h4l5 4V5L9 9z"/><path d="M17 9a4 4 0 010 6"/></svg></button>
+          <button id="ctlconfirm" class="ctlgo" aria-label="confirm to OBS"><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg><em>CONFIRM TO OBS</em></button>
         </div>
       </div>
     </div>
@@ -763,6 +768,8 @@ local PLAYER_HTML = [==[
   var CTLMKMS = 1000, CTLMKNEAR = 0.75, CTLMKH = 0.14;
   var CTLZMPCT = 0.08, CTLZMMIN = 0.4, CTLENDGAP = 0.12;
   var CTLPANELMAX = 0.4;
+  var CTLPANELMIN = 0.9;
+  var ctlGridSaid = '';
   var CTLKICKMS = 900;
   var CTLPREVMS = 400, CTLPREVSEC = 2;
   var CTLSEEKTOL = 0.75, CTLSEEKMS = 1500;
@@ -1210,6 +1217,48 @@ local PLAYER_HTML = [==[
     ctlConfirmPaint();
   }
 
+  function ctlGcd(a, b){
+    a = Math.abs(a);
+    b = Math.abs(b);
+    while (b > 0) { var r = a % b; a = b; b = r; }
+    return a;
+  }
+
+  function ctlLattice(n1, n2, n3, lo, hi, want){
+    var g = ctlGcd(ctlGcd(n1, n2), n3), best = 0, bd = 1e9;
+    if (!(g > 0)) { return 0; }
+    var m = ((n1 / g) % 2 === 1 || (n2 / g) % 2 === 1) ? 2 : 1;
+    for (var k = Math.max(1, Math.ceil(lo * g / m - 1e-9)); k < 1000000; k++) {
+      var t = k * m / g;
+      if (t > hi + 1e-9) { break; }
+      if (Math.abs(t - want) < bd) { bd = Math.abs(t - want); best = t; }
+      if (t > want) { break; }
+    }
+    return best;
+  }
+
+  function ctlPanelNow(px){
+    try {
+      ctlE('ctl').style.fontSize = px + 'px';
+      return ctlE('ctlpanel').offsetHeight || 0;
+    } catch (x) { return 0; }
+  }
+
+  function ctlPanelFit(fs, ph, room){
+    if (ph <= room) { return true; }
+    var f = Math.floor(fs * (room - 2) / (ph - 2) * 20) / 20;
+    for (var i = 0; i < 80 && f >= fs * CTLPANELMIN && f >= 8; i++) {
+      var p = ctlPanelNow(f);
+      if (p > 0 && p <= room) {
+        if (Math.abs((p - 2) / f - (ph - 2) / fs) <= 0.25) { return true; }
+        break;
+      }
+      f -= 0.05;
+    }
+    ctlPanelNow(fs);
+    return false;
+  }
+
   function layoutCtl(){
     if (!ctlOn) { return; }
     var ctl = ctlE('ctl'), panel = ctlE('ctlpanel');
@@ -1240,25 +1289,68 @@ local PLAYER_HTML = [==[
     if (!(bh > 16)) { bh = 16; }
     var s = Math.min(bw / W, bh / H, 2 / 3);
     if (!(s > 0)) { s = 1; }
-    var tx = Math.round((W - s * W) / 2);
+    var dpr = 1;
+    try { dpr = window.devicePixelRatio || 1; } catch (x) {}
+    if (!(dpr >= 0.25 && dpr <= 16)) { dpr = 1; }
+    var ew = W, eh = H, eo = 0, et = 0;
+    try {
+      var pe = ctlE('player');
+      if (pe && pe.offsetWidth > 16 && pe.offsetHeight > 16) {
+        ew = pe.offsetWidth; eh = pe.offsetHeight;
+        eo = pe.offsetLeft; et = pe.offsetTop;
+      }
+    } catch (x) {}
+    var sx = s, sy = s, tx = 0, ty = 0, t = 0, u = 0, whole = false;
+    var tc = 2 * dpr / 3 + 1e-9, lo = s * dpr - 1 / H;
+    for (var wi = 0; wi < 4 && !whole; wi++) {
+      t = ctlLattice(H, eh, et, lo, tc, lo);
+      if (!(t > 0)) { break; }
+      u = ctlLattice(W, ew, eo, t * 0.99, Math.min(t * 1.01, tc, bw * dpr / W), t);
+      if (u > 0 && ctlPanelFit(fs, ph, H - 2 * g - Math.round(t * H) / dpr)) { whole = true; }
+      lo = t + 1e-6;
+    }
+    if (whole) {
+      sx = u / dpr;
+      sy = t / dpr;
+      tx = Math.round((W * dpr - u * W) / 2) / dpr;
+      ty = Math.round(g * dpr) / dpr;
+    } else {
+      var nw = 2 * Math.floor(s * ew * dpr / 2 + 1e-6);
+      var nh = 2 * Math.floor(s * eh * dpr / 2 + 1e-6);
+      if (nw >= 16 && nh >= 16) {
+        sx = nw / (ew * dpr);
+        sy = nh / (eh * dpr);
+      }
+      tx = (Math.round((W - sx * W) / 2 * dpr + sx * eo * dpr) - sx * eo * dpr) / dpr;
+      ty = (Math.round(g * dpr + sy * et * dpr) - sy * et * dpr) / dpr;
+      var gk = W + 'x' + H + '@' + dpr + ':' + ew + ',' + eh + ',' + eo + ',' + et;
+      if (ctlGridSaid !== gk) {
+        ctlGridSaid = gk;
+        report('ctl_grid', '&w=' + W + '&h=' + H + '&dpr=' + dpr);
+      }
+    }
     try {
       win.style.transformOrigin = '0 0';
-      win.style.transform = 'translate(' + tx + 'px,' + g + 'px) scale(' + s + ')';
+      win.style.transform = 'translate(' + tx + 'px,' + ty + 'px) scale(' + sx + ',' + sy + ')';
     } catch (x) {}
     try {
       var mk = ctlE('ctlmk');
       if (mk) {
-        var mh = Math.round(s * H), mf = Math.round(s * H * CTLMKH);
+        var mf = Math.round(sy * H * CTLMKH);
         if (!(mf >= 8)) { mf = 8; }
-        mk.style.left = tx + 'px';
-        mk.style.top = g + 'px';
-        mk.style.width = Math.round(s * W) + 'px';
-        mk.style.height = mh + 'px';
+        mk.style.left = (Math.round(tx * dpr) / dpr) + 'px';
+        mk.style.top = (Math.round(ty * dpr) / dpr) + 'px';
+        mk.style.width = (Math.round(sx * W * dpr) / dpr) + 'px';
+        mk.style.height = (Math.round(sy * H * dpr) / dpr) + 'px';
         mk.style.fontSize = mf + 'px';
       }
     } catch (x) {}
   }
   window.addEventListener('resize', layoutCtl);
+  try {
+    new MutationObserver(layoutCtl).observe(win, { childList: true, subtree: true,
+      attributes: true, attributeFilter: ['style', 'width', 'height'] });
+  } catch (x) {}
 
   function ctlBtnPaint(){
     var pp = ctlPlaying;
@@ -2573,17 +2665,22 @@ sub respond {
   print $cl $head . $body;
 }
 
+my $houseKeep = sub {
+  beat(0);
+  checkProbeRequest();
+  return 'stop' if -e $Stop;
+  my $lost = ownerLost();
+  if ($lost ne '') { say_log("exiting: $lost"); $ownerGone = 1; return 'owner'; }
+  if (time() > $deadline) { say_log('max lifetime reached'); return 'deadline'; }
+  return '';
+};
+
 my $quit = 0;
 while (!$quit) {
-  beat(0);
+  last if $houseKeep->() ne '';
   my @ready = $sel->can_read(0.4);
   if (!@ready) {
-    beat(0);
-    checkProbeRequest();
-    last if -e $Stop;
-    my $lost = ownerLost();
-    if ($lost ne '') { say_log("exiting: $lost"); $ownerGone = 1; last; }
-    if (time() > $deadline) { say_log('max lifetime reached'); last; }
+    last if $houseKeep->() ne '';
     next;
   }
   for my $lsn (@ready) {
@@ -2979,18 +3076,23 @@ say "event sequence seeded at $seq"
 
 $deadline = (Get-Date).AddHours($MaxHours)
 
-while ($true) {
+function houseKeep() {
   beat $false
+  checkProbeRequest
+  if (Test-Path -LiteralPath $Stop) { return 'stop' }
+  $lost = ownerLost
+  if ($lost -ne '') { say "exiting: $lost"; $script:ownerGone = $true; return 'owner' }
+  if ((Get-Date) -gt $script:deadline) { say 'max lifetime reached'; return 'deadline' }
+  return ''
+}
+
+while ($true) {
+  if ((houseKeep) -ne '') { break }
   $task = $listener.GetContextAsync()
   $got = $false
   while ($true) {
     if ($task.AsyncWaitHandle.WaitOne(400)) { $got = $true; break }
-    beat $false
-    checkProbeRequest
-    if (Test-Path -LiteralPath $Stop) { break }
-    $lost = ownerLost
-    if ($lost -ne '') { say "exiting: $lost"; $script:ownerGone = $true; break }
-    if ((Get-Date) -gt $deadline) { say 'max lifetime reached'; break }
+    if ((houseKeep) -ne '') { break }
   }
   if (-not $got) { break }
 
@@ -5562,6 +5664,10 @@ local function poll_events()
                     st.ctl_shown_nonce = nil
                     log("DEFECT: the page reached '%s' with the trim controls still drawn, which must not be possible - the program gate opening takes them down one-way before anything plays. The page's own assert caught it and removed them, so this take is not damaged, but the guarantee that the controls never reach a recording was broken somewhere. Report this line.",
                         cat)
+                elseif etype == "ctl_grid" then
+                    log("The trim picture could not be placed on whole device pixels at %sx%s (pixel ratio %s): no control-panel height inside its usable range gives a scale that is whole on both axes for this canvas and video, and the picture is not shrunk to make one. It is drawn at its natural size on the nearest scale that keeps the iframe layer whole, so the 1px line across its centre can still show. Said once per size. Informational.",
+                        line:match("&w=(%d+)") or "?", line:match("&h=(%d+)") or "?",
+                        line:match("&dpr=([%d%.]+)") or "?")
                 elseif etype == "go" then
                     log("The page saw the program gate open and started its run-up. Everything before this was the first frame held still and silent in preview.")
                 elseif etype == "go_unavailable" then
