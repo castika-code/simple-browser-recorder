@@ -1,5 +1,5 @@
 -- Castika Simple Browser Recorder (Lua Script)
--- v1.0.8 - 2026-10-09
+-- v1.0.9 - 2026-10-09
 -- Copyright (c) 2026 Castika
 -- Licensed under the Apache License, Version 2.0
 -- https://github.com/Castika-Coce/simple-browser-recorder
@@ -7,7 +7,7 @@
 obs = obslua
 
 local TAG = "[YT Embed Rec]"
-local SCRIPT_VERSION = "v1.0.8 - 2026-10-09"
+local SCRIPT_VERSION = "v1.0.9 - 2026-10-09"
 local TICK_MS = 100
 local EVENT_POLL_EVERY = 1
 local DELIVERY_MS = 21 + 160 + (EVENT_POLL_EVERY * TICK_MS) + 107
@@ -265,10 +265,10 @@ local function guard(where, fn, arg, strict)
     if st.slow_said[where] then return res end
     st.slow_said[where] = true
     if strict then
-        logw("%s took %.0fms against a %dms budget. Worst seen so far %.0fms. This is printed once for each entry point. It is a warning, not a failure, and nothing has been stopped.",
+        log("%s took %.0fms against a %dms budget. Worst seen so far %.0fms. This is printed once for each entry point. It is a warning, not a failure, and nothing has been stopped: it is logged at INFO so it does not force this window open, because the frames it costs land inside the masked head and never reach a file. A hardware encoder being created at the start of a take is the ordinary cause.",
             where, ms, TICK_MS, st.slow_worst)
     else
-        logw("%s took %.0fms. It does not run on the render thread, so there is no frame budget and nothing was dropped, but it runs where OBS draws its menus and OBS could not answer for that long. Reported once, well past anything normal: loading this script and opening its settings are expected to take a moment.",
+        log("%s took %.0fms. It does not run on the render thread, so there is no frame budget and nothing was dropped, but it runs where OBS draws its menus and OBS could not answer for that long. Reported once, well past anything normal: loading this script and opening its settings are expected to take a moment.",
             where, ms)
     end
     return res
@@ -758,7 +758,6 @@ local PLAYER_HTML = [==[
   var ctlPrevAt = 0, ctlPrevWho = '', ctlPrevEnd = -1, ctlPrevBack = -1;
   var ctlWantT = -1, ctlWantMs = 0;
   var ctlPrevFrom = -1;
-  var ctlKickAt = 0, ctlKickOn = false, ctlDurTold = false;
   var ctlKickAt = 0, ctlKickOn = false, ctlDurTold = false;
   var ctlZoom = '';
   var ctlZA = -1, ctlZB = -1;
@@ -1821,21 +1820,34 @@ local PLAYER_HTML = [==[
       ctlMoved = true;
       ctlSetBy(who, t, false);
     };
-    var up = function(e){
+    var done = false;
+    var off = function(){
+      if (done) { return; }
+      done = true;
       try { lit.classList.remove('ctldrag'); } catch (x) {}
       el.removeEventListener('pointermove', move);
       el.removeEventListener('pointerup', up);
       el.removeEventListener('pointercancel', up);
-      var t = ctlTAt(e);
-      if (t >= 0 && !(hold && !ctlMoved)) { ctlSetBy(who, t, true); }
+      el.removeEventListener('lostpointercapture', off);
+      try { window.removeEventListener('pointerup', off); } catch (x) {}
+      try { window.removeEventListener('pointercancel', off); } catch (x) {}
       ctlDrag = false;
       ctlMoved = false;
       ctlConfirmPaint();
       if (ctlDragPlay) { ctlPlay(); }
     };
+    var up = function(e){
+      if (done) { return; }
+      var t = ctlTAt(e);
+      if (t >= 0 && !(hold && !ctlMoved)) { ctlSetBy(who, t, true); }
+      off();
+    };
     el.addEventListener('pointermove', move);
     el.addEventListener('pointerup', up);
     el.addEventListener('pointercancel', up);
+    el.addEventListener('lostpointercapture', off);
+    try { window.addEventListener('pointerup', off); } catch (x) {}
+    try { window.addEventListener('pointercancel', off); } catch (x) {}
     try { ev.preventDefault(); } catch (x) {}
   }
 
@@ -5680,7 +5692,7 @@ local function poll_events()
                         stt, PLAYING_FALLBACK_MS)
                 elseif etype == "ready" then
                     if dur and dur > 0 then
-                        log("Video length: %.1fs", dur)
+                        log("Video length: %.1fs (page report, 'ready'). Two of these in a row means the page loaded twice, not that anything was read twice.", dur)
                     end
                     local ov = effective_out_sec()
                     if dur and dur > 0 and ov > 0 and ov >= dur
@@ -5810,7 +5822,7 @@ local function poll_events()
                         end
                         local va = pw / ph
                         local ca = (ch > 0) and (cw / ch) or 0
-                        log("Video is %dx%d (%.3f); canvas is %dx%d (%.3f).",
+                        log("Video is %dx%d (%.3f); canvas is %dx%d (%.3f). (native-size probe answer.) Two of these in a row means the size was asked for twice, which a page reload does.",
                             pw, ph, va, cw, ch, ca)
                         if ca > 0 and math.abs(va - ca) / ca > 0.01 then
                             log("The canvas and the video have different shapes. With 'Fit centered to the OBS canvas' on, the file is the canvas size with the video centered inside it and bars on the spare axis; with it off, the file is %dx%d, the video's own size. Either way nothing is cropped and there is nothing to change.",
