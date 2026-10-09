@@ -1,5 +1,5 @@
 -- Castika Simple Browser Recorder (Lua Script)
--- v1.0.7 - 2026-10-09
+-- v1.0.8 - 2026-10-09
 -- Copyright (c) 2026 Castika
 -- Licensed under the Apache License, Version 2.0
 -- https://github.com/Castika-Coce/simple-browser-recorder
@@ -7,7 +7,7 @@
 obs = obslua
 
 local TAG = "[YT Embed Rec]"
-local SCRIPT_VERSION = "v1.0.7 - 2026-10-09"
+local SCRIPT_VERSION = "v1.0.8 - 2026-10-09"
 local TICK_MS = 100
 local EVENT_POLL_EVERY = 1
 local DELIVERY_MS = 21 + 160 + (EVENT_POLL_EVERY * TICK_MS) + 107
@@ -1080,7 +1080,11 @@ local PLAYER_HTML = [==[
   }
   function ctlAt(){
     if (!player) { return -1; }
-    try { var t = player.getCurrentTime(); return (t >= 0) ? t : -1; } catch (x) { return -1; }
+    try {
+      var t = player.getCurrentTime();
+      if (!(t >= 0)) { return -1; }
+      return (t < FR) ? 0 : t;
+    } catch (x) { return -1; }
   }
 
   function ctlOutV(){
