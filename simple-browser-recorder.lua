@@ -1,5 +1,5 @@
 -- Castika Simple Browser Recorder (Lua Script)
--- v1.1.0 - 2026-10-09
+-- v1.1.1 - 2026-10-11
 -- Copyright (c) 2026 Castika
 -- Licensed under the Apache License, Version 2.0
 -- https://github.com/castika-code/simple-browser-recorder
@@ -7,13 +7,13 @@
 obs = obslua
 
 local TAG = "[YT Embed Rec]"
-local SCRIPT_VERSION = "v1.1.0 - 2026-10-09"
+local SCRIPT_VERSION = "v1.1.1 - 2026-10-11"
 local TICK_MS = 100
 local EVENT_POLL_EVERY = 1
 local DELIVERY_MS = 21 + 160 + (EVENT_POLL_EVERY * TICK_MS) + 107
 local OVERSCAN_PX = 140
 local UNMASK_DEADLINE_MS = 3000
--- YouTube draws its centre control on any player activity
+-- YouTube draws its center control on any player activity
 local RUNUP_SEC = 5
 local PLAYING_FALLBACK_MS = 6000 + (RUNUP_SEC * 1000) + UNMASK_DEADLINE_MS + 4000
 local UNMASK_WAIT_MS = 6000
@@ -424,7 +424,7 @@ local function url_enc(s)
     end))
 end
 
--- OBS colour is 0xAABBGGRR; OBS Lua 5.1 has no bitwise operators
+-- OBS color is 0xAABBGGRR; OBS Lua 5.1 has no bitwise operators
 local function rgba_hex(v)
     v = math.floor(tonumber(v) or 0)
     local r = v % 256
@@ -3793,7 +3793,7 @@ function UPD.tell()
     if st.upd_told or not cfg.update_check then return end
     st.upd_told = true
     if script_settings then UPD.save(script_settings) end
-    log("UPDATE CHECK IS ON, as it is by default. Once a day, and again whenever this script's version changes, the local server asks GitHub (https://api.github.com/repos/castika-code/simple-browser-recorder/releases/latest, a public page) which release is newest, and when that is newer than this one the trim controls show a blue banner saying so. Until this version the only site this script contacted was YouTube. The request carries no video, key or account of yours; GitHub sees this machine's address as any website would. The switch is 'Tell me in the trim controls when a newer version is out' at the bottom of this script's settings: off means no request at all, and off then on again checks at once. This line is said once.")
+    log("UPDATE CHECK IS ON, as it is by default. Once a day, and again whenever this script's version changes, the local server asks GitHub (https://api.github.com/repos/castika-code/simple-browser-recorder/releases/latest, a public page) which release is newest, and when that is newer than this one the trim controls show a blue banner saying so. Until this version the only site this script contacted was YouTube. The request carries no video, key or account of yours; GitHub sees this machine's address as any website would. The switch is 'Check for updates' at the bottom of this script's settings: off means no request at all, and off then on again checks at once. This line is said once.")
 end
 
 function UPD.switched(was)
@@ -5812,7 +5812,7 @@ local function do_start_recording(why)
 
     local silenced = aud_isolate()
     if silenced > 0 then
-        log("REC sound is 'Source only', so the %d other source(s) that carry audio have OBS audio track %d turned off for the length of this take and turned back on a second or two after the file closes - on a default install that is OBS's own Desktop Audio and Mic/Aux, which belong to no scene. NOTHING IS MUTED AND NO FADER IS MOVED: one track per source is the whole change, and your other tracks carry exactly what they always carried, so your own monitoring and your own recording are unaffected. If you open Advanced Audio Properties during a take you will see track %d unticked on those sources, and it is ticked again on its own. The list of what was changed, each with the tracks it had, is written into this script's settings as each one is changed, so if OBS stops before the restore the next load puts them back and says so.",
+        log("REC sound is 'Source only', so the %d other source(s) that carry audio have OBS audio track %d turned off for the length of this take and turned back on a second or two after the file closes - on a default install that is OBS's own Desktop Audio and Mic/Aux, which belong to no scene. NOTHING IS MUTED AND NO FADER IS MOVED: one track per source is the whole change, and your other tracks carry exactly what they always carried, so your own monitoring and your own recording are unaffected. If you open Advanced Audio Properties during a take you will see track %d unchecked on those sources, and it is checked again on its own. The list of what was changed, each with the tracks it had, is written into this script's settings as each one is changed, so if OBS stops before the restore the next load puts them back and says so.",
             silenced, MAX_AUDIO_MIXES, MAX_AUDIO_MIXES)
     end
 
@@ -5974,7 +5974,7 @@ local function poll_events()
                     log("DEFECT: the page reached '%s' with the trim controls still drawn, which must not be possible - the program gate opening takes them down one-way before anything plays. The page's own assert caught it and removed them, so this take is not damaged, but the guarantee that the controls never reach a recording was broken somewhere. Report this line.",
                         cat)
                 elseif etype == "ctl_grid" then
-                    log("The trim picture could not be placed on whole device pixels at %sx%s (pixel ratio %s): no control-panel height inside its usable range gives a scale that is whole on both axes for this canvas and video, and the picture is not shrunk to make one. It is drawn at its natural size on the nearest scale that keeps the iframe layer whole, so the 1px line across its centre can still show. Said once per size. Informational.",
+                    log("The trim picture could not be placed on whole device pixels at %sx%s (pixel ratio %s): no control-panel height inside its usable range gives a scale that is whole on both axes for this canvas and video, and the picture is not shrunk to make one. It is drawn at its natural size on the nearest scale that keeps the iframe layer whole, so the 1px line across its center can still show. Said once per size. Informational.",
                         line:match("&w=(%d+)") or "?", line:match("&h=(%d+)") or "?",
                         line:match("&dpr=([%d%.]+)") or "?")
                 elseif etype == "go" then
@@ -6803,7 +6803,7 @@ local function script_properties_body()
         obs.OBS_GROUP_NORMAL, grec)
 
     obs.obs_properties_add_bool(props, "update_check",
-        "Tell me in the trim controls when a newer version is out - asks GitHub once a day")
+        "Check for updates (GitHub, once a day)")
 
     apply_take_lock(props)
     refresh_visibility(props, script_settings)
