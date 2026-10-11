@@ -28,11 +28,18 @@ the video - and its own encoder and output. The encoder, the container and the o
 folder are copied from your OBS recording settings, so the clip matches everything else you
 produce.
 
-Two things follow.
+Three things follow.
 
-- **Your own recording or stream is untouched.** You can be live and still cut a quote.
-- **Nothing else on screen appears in the file.** Not the `REC` banner, not the trim
-  controls, not the rest of your scene. Only the video.
+- **It never touches OBS's own recording or stream.** The script writes a separate file
+  through its own output.
+- **The scene has to be on Program for the take.** That is what starts it and stops it.
+  This is not a silent background capture. The quote goes out on Program while it is being
+  cut, so your viewers see it if you are live. When the take ends, the script puts Program
+  back on the previous scene.
+- **Program and the file are not the same picture.** While a take runs, Program shows the
+  `REC` banner over the video. The file does not. The script captures the browser source on
+  its own, so the banner, the trim controls and the rest of your scene never reach it. The
+  credit does - the page draws that into the video itself.
 
 **Fit centered to the OBS canvas** makes the file your canvas size - 1920x1080, or whatever
 your scene is - with the video centered inside it. Turn it on and the clip is finished the
@@ -109,8 +116,6 @@ that is a real transition, so your configured fade will play.
 | **Source credit** | Puts the source in the picture, so a quote carries its attribution wherever it ends up. Choose `YouTube @handle`, `YouTube channel name`, the handle or channel name alone, or your own text. Font, colors, corner, and height are yours to set, and what you see in the preview is what lands in the file. Off by default; turn it on to open the details. |
 | **Max recording time** | A cap that stops a runaway take. |
 | **Check for updates** | On by default. See [Network](#network). |
-
-Encoder, container, and output folder come from your OBS recording settings.
 
 ## Known Limitations
 
